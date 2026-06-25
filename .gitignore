@@ -1,0 +1,11 @@
+.DS_Store
+
+# Go build/test output
+*.test
+coverage.out
+coverage.html
+dist/
+
+# Local scratch
+.tmp/
+tmp/
