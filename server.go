@@ -17,26 +17,26 @@ const DefaultHandshakeTimeout = 5 * time.Second
 
 // ServerOptions configures a GoRPC server.
 type ServerOptions struct {
-	ServiceName      string
 	Codec            Codec
 	MaxFrameSize     int64
 	HandshakeTimeout time.Duration
+	Auth             Auth
 	Logger           *slog.Logger
 }
 
-// HandlerFunc is the typed function shape used by registered unary methods.
-type HandlerFunc[Req, Resp any] func(context.Context, Req) (Resp, error)
+// HandlerFunc is the typed function shape used by registered unary functions.
+type HandlerFunc[Req, Resp any] func(*Context, Req) (Resp, error)
 
-// Server accepts GoRPC connections and dispatches registered methods.
+// Server accepts GoRPC connections and dispatches registered functions.
 type Server struct {
-	serviceName      string
 	codec            Codec
 	maxFrameSize     int64
 	handshakeTimeout time.Duration
+	auth             Auth
 	logger           *slog.Logger
 
 	handlerMu sync.RWMutex
-	handlers  map[route]handler
+	handlers  map[string]handler
 
 	listenerMu sync.Mutex
 	listener   net.Listener
@@ -48,37 +48,31 @@ type Server struct {
 	wg           sync.WaitGroup
 }
 
-type route struct {
-	service string
-	method  string
-}
-
-type handler func(context.Context, []byte) ([]byte, error)
+type handler func(*Context, []byte) ([]byte, error)
 
 // NewServer creates a Server with default codec and limits where options are unset.
 func NewServer(opts ServerOptions) *Server {
 	return &Server{
-		serviceName:      opts.ServiceName,
 		codec:            defaultCodec(opts.Codec),
 		maxFrameSize:     normalizeMaxFrameSize(opts.MaxFrameSize),
 		handshakeTimeout: normalizeHandshakeTimeout(opts.HandshakeTimeout),
+		auth:             opts.Auth,
 		logger:           opts.Logger,
-		handlers:         make(map[route]handler),
+		handlers:         make(map[string]handler),
 		conns:            make(map[*serverConn]struct{}),
 	}
 }
 
-// Register binds a typed unary handler to a service and method name.
-func Register[Req, Resp any](s *Server, service, method string, fn HandlerFunc[Req, Resp]) error {
+// Register binds a typed unary handler to a function name.
+func Register[Req, Resp any](s *Server, function string, fn HandlerFunc[Req, Resp]) error {
 	if s == nil {
 		return ErrClosed
 	}
-	if service == "" || method == "" || fn == nil {
-		return ErrInvalidRoute
+	if function == "" || fn == nil {
+		return ErrInvalidFunction
 	}
 
-	r := route{service: service, method: method}
-	wrapped := func(ctx context.Context, payload []byte) ([]byte, error) {
+	wrapped := func(ctx *Context, payload []byte) ([]byte, error) {
 		var req Req
 		if err := s.codec.Unmarshal(payload, &req); err != nil {
 			return nil, NewRemoteError(ErrorCodeInvalidRequest, fmt.Sprintf("decode request: %v", err), nil)
@@ -100,26 +94,54 @@ func Register[Req, Resp any](s *Server, service, method string, fn HandlerFunc[R
 	s.handlerMu.Lock()
 	defer s.handlerMu.Unlock()
 
-	if _, exists := s.handlers[r]; exists {
-		return ErrDuplicateRoute
+	if _, exists := s.handlers[function]; exists {
+		return ErrDuplicateFunction
 	}
-	s.handlers[r] = wrapped
+	s.handlers[function] = wrapped
 
 	return nil
 }
 
 // MustRegister is Register that panics on error.
-func MustRegister[Req, Resp any](s *Server, service, method string, fn HandlerFunc[Req, Resp]) {
-	if err := Register(s, service, method, fn); err != nil {
+func MustRegister[Req, Resp any](s *Server, function string, fn HandlerFunc[Req, Resp]) {
+	if err := Register(s, function, fn); err != nil {
 		panic(err)
 	}
 }
 
-// Serve accepts GoRPC connections from ln until ctx is canceled or Shutdown is called.
-func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	if ctx == nil {
-		ctx = context.Background()
+// ServeTCP listens on address with the "tcp" network and serves GoRPC connections.
+func (s *Server) ServeTCP(address string) error {
+	ln, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
 	}
+
+	return s.ServeListener(ln)
+}
+
+// ServeUnix listens on path with the "unix" network and serves GoRPC connections.
+func (s *Server) ServeUnix(path string) error {
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return err
+	}
+
+	return s.ServeListener(ln)
+}
+
+// ServeUnixPacket listens on path with the "unixpacket" network and serves GoRPC connections.
+func (s *Server) ServeUnixPacket(path string) error {
+	ln, err := net.Listen("unixpacket", path)
+	if err != nil {
+		return err
+	}
+
+	return s.ServeListener(ln)
+}
+
+// ServeListener accepts GoRPC connections from ln until Shutdown is called or
+// the listener returns an unrecoverable error.
+func (s *Server) ServeListener(ln net.Listener) error {
 	if ln == nil {
 		return fmt.Errorf("%w: nil listener", ErrProtocol)
 	}
@@ -128,15 +150,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 	defer s.clearListener(ln)
 
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-	}()
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if s.shuttingDown.Load() || ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+			if s.shuttingDown.Load() || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			return err
@@ -145,23 +162,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.serveConn(ctx, conn)
+			s.serveConn(conn)
 		}()
 	}
-}
-
-// ListenAndServe listens on network/address and serves GoRPC connections.
-func (s *Server) ListenAndServe(ctx context.Context, network, address string) error {
-	if network == "" {
-		network = "tcp"
-	}
-
-	ln, err := net.Listen(network, address)
-	if err != nil {
-		return err
-	}
-
-	return s.Serve(ctx, ln)
 }
 
 // Shutdown closes the listener, closes active connections, and waits for handlers to exit.
@@ -197,7 +200,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (s *Server) serveConn(parent context.Context, conn net.Conn) {
+func (s *Server) serveConn(conn net.Conn) {
 	sc := newServerConn(s, conn)
 	s.addConn(sc)
 	defer func() {
@@ -205,10 +208,12 @@ func (s *Server) serveConn(parent context.Context, conn net.Conn) {
 		_ = sc.close()
 	}()
 
-	if err := s.serverHandshake(conn); err != nil {
+	clientName, err := s.serverHandshake(conn)
+	if err != nil {
 		s.logDebug("gorpc handshake failed", "error", err)
 		return
 	}
+	sc.clientName = clientName
 
 	for {
 		frame, err := readFrame(conn, s.maxFrameSize, s.codec)
@@ -221,7 +226,7 @@ func (s *Server) serveConn(parent context.Context, conn net.Conn) {
 
 		switch frame.Type {
 		case FrameRequest:
-			sc.startRequest(parent, frame)
+			sc.startRequest(frame)
 		case FrameCancel:
 			sc.cancel(frame.RequestID)
 		case FramePing:
@@ -232,7 +237,7 @@ func (s *Server) serveConn(parent context.Context, conn net.Conn) {
 	}
 }
 
-func (s *Server) serverHandshake(conn net.Conn) error {
+func (s *Server) serverHandshake(conn net.Conn) (string, error) {
 	if s.handshakeTimeout > 0 {
 		_ = conn.SetDeadline(time.Now().Add(s.handshakeTimeout))
 		defer func() {
@@ -242,43 +247,123 @@ func (s *Server) serverHandshake(conn net.Conn) error {
 
 	frame, err := readFrame(conn, s.maxFrameSize, s.codec)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if frame.Type != FrameHello {
-		return fmt.Errorf("%w: expected hello, got %s", ErrProtocol, frame.Type.String())
+		return "", fmt.Errorf("%w: expected hello, got %s", ErrProtocol, frame.Type.String())
 	}
 
 	var hello hello
 	if err := s.codec.Unmarshal(frame.Payload, &hello); err != nil {
-		return fmt.Errorf("decode hello: %w", err)
+		return "", fmt.Errorf("decode hello: %w", err)
 	}
 	if hello.ProtocolVersion != ProtocolVersion {
-		return fmt.Errorf("%w: unsupported version %d", ErrProtocol, hello.ProtocolVersion)
+		return "", fmt.Errorf("%w: unsupported version %d", ErrProtocol, hello.ProtocolVersion)
 	}
 	if hello.Codec != s.codec.Name() {
-		return fmt.Errorf("%w: unsupported codec %q", ErrProtocol, hello.Codec)
+		return "", fmt.Errorf("%w: unsupported codec %q", ErrProtocol, hello.Codec)
 	}
 
-	payload, err := s.codec.Marshal(helloAck{
+	ack := helloAck{
 		ProtocolVersion: ProtocolVersion,
 		Codec:           s.codec.Name(),
-		ServiceName:     s.serviceName,
-	})
+	}
+	var authChallenge []byte
+	if s.auth.enabledAuth() {
+		authChallenge, err = s.auth.challenge()
+		if err != nil {
+			return "", err
+		}
+		ack.AuthRequired = true
+		ack.AuthMethod = s.auth.method()
+		ack.AuthChallenge = authChallenge
+	}
+
+	payload, err := s.codec.Marshal(ack)
 	if err != nil {
-		return fmt.Errorf("encode hello ack: %w", err)
+		return "", fmt.Errorf("encode hello ack: %w", err)
+	}
+
+	if err := writeFrame(conn, s.maxFrameSize, s.codec, Frame{
+		Type:    FrameHelloAck,
+		Payload: payload,
+	}); err != nil {
+		return "", err
+	}
+
+	if s.auth.enabledAuth() {
+		if err := s.readAuth(conn, hello, authChallenge); err != nil {
+			return "", err
+		}
+	}
+
+	return hello.ClientName, nil
+}
+
+func (s *Server) readAuth(conn net.Conn, hello hello, challenge []byte) error {
+	frame, err := readFrame(conn, s.maxFrameSize, s.codec)
+	if err != nil {
+		return err
+	}
+	if frame.Type != FrameAuth {
+		_ = s.writeHandshakeError(conn, RemoteError{
+			Code:    ErrorCodeUnauthorized,
+			Message: "authentication is required",
+		})
+		return fmt.Errorf("%w: expected auth, got %s", ErrAuthentication, frame.Type.String())
+	}
+
+	var request authRequest
+	if err := s.codec.Unmarshal(frame.Payload, &request); err != nil {
+		_ = s.writeHandshakeError(conn, RemoteError{
+			Code:    ErrorCodeUnauthorized,
+			Message: "invalid authentication payload",
+		})
+		return fmt.Errorf("%w: decode auth: %v", ErrAuthentication, err)
+	}
+	if request.Method != s.auth.method() {
+		_ = s.writeHandshakeError(conn, RemoteError{
+			Code:    ErrorCodeUnauthorized,
+			Message: "unsupported authentication method",
+		})
+		return fmt.Errorf("%w: unsupported method %q", ErrAuthentication, request.Method)
+	}
+	if !s.auth.verify(challenge, hello.ProtocolVersion, hello.Codec, hello.ClientName, request.Signature) {
+		_ = s.writeHandshakeError(conn, RemoteError{
+			Code:    ErrorCodeUnauthorized,
+			Message: "authentication failed",
+		})
+		return ErrAuthentication
+	}
+
+	payload, err := s.codec.Marshal(authAck{OK: true})
+	if err != nil {
+		return fmt.Errorf("encode auth ack: %w", err)
 	}
 
 	return writeFrame(conn, s.maxFrameSize, s.codec, Frame{
-		Type:    FrameHelloAck,
+		Type:    FrameAuthAck,
 		Payload: payload,
 	})
 }
 
-func (s *Server) findHandler(service, method string) handler {
+func (s *Server) writeHandshakeError(conn net.Conn, remoteErr RemoteError) error {
+	payload, err := s.codec.Marshal(remoteErr)
+	if err != nil {
+		return err
+	}
+
+	return writeFrame(conn, s.maxFrameSize, s.codec, Frame{
+		Type:    FrameError,
+		Payload: payload,
+	})
+}
+
+func (s *Server) findHandler(function string) handler {
 	s.handlerMu.RLock()
 	defer s.handlerMu.RUnlock()
 
-	return s.handlers[route{service: service, method: method}]
+	return s.handlers[function]
 }
 
 func (s *Server) setListener(ln net.Listener) bool {
@@ -323,8 +408,9 @@ func (s *Server) logDebug(msg string, args ...any) {
 }
 
 type serverConn struct {
-	server *Server
-	conn   net.Conn
+	server     *Server
+	conn       net.Conn
+	clientName string
 
 	writeMu sync.Mutex
 
@@ -340,7 +426,7 @@ func newServerConn(server *Server, conn net.Conn) *serverConn {
 	}
 }
 
-func (c *serverConn) startRequest(parent context.Context, frame Frame) {
+func (c *serverConn) startRequest(frame Frame) {
 	if frame.RequestID == 0 {
 		_ = c.writeError(frame, RemoteError{
 			Code:    ErrorCodeInvalidRequest,
@@ -348,12 +434,19 @@ func (c *serverConn) startRequest(parent context.Context, frame Frame) {
 		})
 		return
 	}
+	if frame.Function == "" {
+		_ = c.writeError(frame, RemoteError{
+			Code:    ErrorCodeInvalidRequest,
+			Message: "function is required",
+		})
+		return
+	}
 
-	h := c.server.findHandler(frame.Service, frame.Method)
+	h := c.server.findHandler(frame.Function)
 	if h == nil {
 		_ = c.writeError(frame, RemoteError{
 			Code:    ErrorCodeNotFound,
-			Message: fmt.Sprintf("method %s/%s is not registered", frame.Service, frame.Method),
+			Message: fmt.Sprintf("function %q is not registered", frame.Function),
 		})
 		return
 	}
@@ -362,9 +455,18 @@ func (c *serverConn) startRequest(parent context.Context, frame Frame) {
 	var cancel context.CancelFunc
 	if frame.DeadlineUnixNano > 0 {
 		deadline := time.Unix(0, frame.DeadlineUnixNano)
-		ctx, cancel = context.WithDeadline(parent, deadline)
+		ctx, cancel = context.WithDeadline(context.Background(), deadline)
 	} else {
-		ctx, cancel = context.WithCancel(parent)
+		ctx, cancel = context.WithCancel(context.Background())
+	}
+
+	rpcCtx := &Context{
+		Context:    ctx,
+		clientName: c.clientName,
+		requestID:  frame.RequestID,
+		function:   frame.Function,
+		remoteAddr: c.conn.RemoteAddr(),
+		localAddr:  c.conn.LocalAddr(),
 	}
 
 	c.requestMu.Lock()
@@ -373,13 +475,19 @@ func (c *serverConn) startRequest(parent context.Context, frame Frame) {
 
 	go func() {
 		defer func() {
+			if recovered := recover(); recovered != nil {
+				_ = c.writeError(frame, RemoteError{
+					Code:    ErrorCodeInternal,
+					Message: fmt.Sprintf("handler panic: %v", recovered),
+				})
+			}
 			cancel()
 			c.requestMu.Lock()
 			delete(c.requests, frame.RequestID)
 			c.requestMu.Unlock()
 		}()
 
-		payload, err := h(ctx, frame.Payload)
+		payload, err := h(rpcCtx, frame.Payload)
 		if err != nil {
 			_ = c.writeError(frame, remoteErrorFromError(err))
 			return
@@ -388,8 +496,7 @@ func (c *serverConn) startRequest(parent context.Context, frame Frame) {
 		_ = c.write(Frame{
 			Type:      FrameResponse,
 			RequestID: frame.RequestID,
-			Service:   frame.Service,
-			Method:    frame.Method,
+			Function:  frame.Function,
 			Payload:   payload,
 		})
 	}()
@@ -414,8 +521,7 @@ func (c *serverConn) writeError(request Frame, remoteErr RemoteError) error {
 	return c.write(Frame{
 		Type:      FrameError,
 		RequestID: request.RequestID,
-		Service:   request.Service,
-		Method:    request.Method,
+		Function:  request.Function,
 		Payload:   payload,
 	})
 }

@@ -13,14 +13,19 @@ const (
 	ErrorCodeInternal         = "internal"
 	ErrorCodeInvalidRequest   = "invalid_request"
 	ErrorCodeNotFound         = "not_found"
+	ErrorCodeUnauthorized     = "unauthorized"
 	ErrorCodeUnavailable      = "unavailable"
 )
 
 // Common GoRPC errors.
 var (
-	ErrClosed         = errors.New("gorpc: closed")
-	ErrDuplicateRoute = errors.New("gorpc: duplicate route")
-	ErrInvalidRoute   = errors.New("gorpc: invalid route")
+	ErrClosed            = errors.New("gorpc: closed")
+	ErrAuthentication    = errors.New("gorpc: authentication failed")
+	ErrDuplicateFunction = errors.New("gorpc: duplicate function")
+	ErrInvalidFunction   = errors.New("gorpc: invalid function")
+	ErrInvalidHandler    = errors.New("gorpc: invalid handler")
+	ErrInvalidResponse   = errors.New("gorpc: invalid response")
+	ErrUnavailable       = errors.New("gorpc: unavailable")
 )
 
 // RemoteError is sent in FrameError payloads and returned by callers when the

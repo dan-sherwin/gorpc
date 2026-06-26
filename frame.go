@@ -9,7 +9,7 @@ import (
 )
 
 // DefaultMaxFrameSize is the default maximum encoded frame size.
-const DefaultMaxFrameSize int64 = 16 * 1024 * 1024
+const DefaultMaxFrameSize int64 = 64 * 1024 * 1024
 
 // Frame read/write errors.
 var (

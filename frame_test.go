@@ -14,8 +14,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	want := Frame{
 		Type:      FrameRequest,
 		RequestID: 42,
-		Service:   "ChannelTracker",
-		Method:    "GetChannel",
+		Function:  "get_an_item",
 		Payload:   []byte("payload"),
 	}
 	if err := writeFrame(&buf, DefaultMaxFrameSize, codec, want); err != nil {
@@ -30,7 +29,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	if got.Version != ProtocolVersion {
 		t.Fatalf("version = %d, want %d", got.Version, ProtocolVersion)
 	}
-	if got.Type != want.Type || got.RequestID != want.RequestID || got.Service != want.Service || got.Method != want.Method {
+	if got.Type != want.Type || got.RequestID != want.RequestID || got.Function != want.Function {
 		t.Fatalf("frame mismatch: got %+v want %+v", got, want)
 	}
 	if !bytes.Equal(got.Payload, want.Payload) {

@@ -5,7 +5,7 @@ import "github.com/vmihailenco/msgpack/v5"
 // CodecMessagePack is the v1 MessagePack codec name used during handshake.
 const CodecMessagePack = "msgpack"
 
-// Codec marshals frame envelopes and method payloads.
+// Codec marshals frame envelopes and function payloads.
 type Codec interface {
 	Name() string
 	Marshal(v any) ([]byte, error)
