@@ -19,6 +19,14 @@ type getItemResponse struct {
 	Name string
 }
 
+type clientInfoRequest struct {
+	Prefix string
+}
+
+type clientInfoResponse struct {
+	Message string
+}
+
 func TestUnaryRoundTrip(t *testing.T) {
 	server, address, shutdown := startTestServer(t)
 	defer shutdown()
@@ -41,6 +49,98 @@ func TestUnaryRoundTrip(t *testing.T) {
 	}
 	if resp.ID != "abc123" || resp.Name != "Widget Pack" {
 		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestBidirectionalRequestFromServerHandler(t *testing.T) {
+	server, address, shutdown := startTestServer(t)
+	defer shutdown()
+
+	MustRegister(server, "get_an_item", func(ctx *Context, req getItemRequest) (getItemResponse, error) {
+		if ctx.Conn() == nil {
+			return getItemResponse{}, errors.New("server request context did not expose the connection")
+		}
+
+		var clientResp clientInfoResponse
+		if err := ctx.CallWithTimeout("client_info", clientInfoRequest{Prefix: req.ID}, &clientResp, time.Second); err != nil {
+			return getItemResponse{}, err
+		}
+
+		return getItemResponse{ID: req.ID, Name: clientResp.Message}, nil
+	})
+
+	client := NewTCPClient(address, "bidirectional-handler-client", ClientOptions{
+		PingInterval: -1,
+	})
+	MustRegister(client, "client_info", func(ctx *Context, req clientInfoRequest) (clientInfoResponse, error) {
+		if ctx.RequestID() == 0 {
+			return clientInfoResponse{}, errors.New("client handler request ID was not set")
+		}
+		if ctx.Function() != "client_info" {
+			return clientInfoResponse{}, errors.New("client handler function was not set")
+		}
+		if ctx.RemoteAddr() == nil {
+			return clientInfoResponse{}, errors.New("client handler remote addr was not set")
+		}
+
+		return clientInfoResponse{Message: req.Prefix + "-from-client"}, nil
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	var resp getItemResponse
+	if err := client.Call("get_an_item", getItemRequest{ID: "abc123"}, &resp); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if resp.ID != "abc123" || resp.Name != "abc123-from-client" {
+		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestServerCanInitiateRequestAfterConnect(t *testing.T) {
+	results := make(chan clientInfoResponse, 1)
+	errs := make(chan error, 1)
+
+	_, address, shutdown := startTestServerWithOptions(t, ServerOptions{
+		OnConnect: func(conn *Conn) {
+			var resp clientInfoResponse
+			if err := conn.CallWithTimeout("client_info", clientInfoRequest{Prefix: "hello"}, &resp, time.Second); err != nil {
+				errs <- err
+				return
+			}
+			results <- resp
+		},
+	})
+	defer shutdown()
+
+	client := NewTCPClient(address, "on-connect-client", ClientOptions{
+		PingInterval: -1,
+	})
+	MustRegister(client, "client_info", func(_ *Context, req clientInfoRequest) (clientInfoResponse, error) {
+		return clientInfoResponse{Message: req.Prefix + "-from-on-connect-client"}, nil
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	select {
+	case err := <-errs:
+		t.Fatalf("server initiated call: %v", err)
+	case resp := <-results:
+		if resp.Message != "hello-from-on-connect-client" {
+			t.Fatalf("resp = %+v", resp)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server initiated call did not complete")
 	}
 }
 

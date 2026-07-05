@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,19 +22,26 @@ type ServerOptions struct {
 	MaxFrameSize     int64
 	HandshakeTimeout time.Duration
 	Auth             Auth
+	WriteTimeout     time.Duration
 	Logger           *slog.Logger
+	OnConnect        func(*Conn)
+	OnDisconnect     func(*Conn)
 }
 
 // HandlerFunc is the typed function shape used by registered unary functions.
 type HandlerFunc[Req, Resp any] func(*Context, Req) (Resp, error)
 
-// Server accepts GoRPC connections and dispatches registered functions.
+// Server accepts GoRPC connections, dispatches registered functions, and exposes
+// accepted connections that can initiate requests back to the dialing side.
 type Server struct {
 	codec            Codec
 	maxFrameSize     int64
 	handshakeTimeout time.Duration
 	auth             Auth
+	writeTimeout     time.Duration
 	logger           *slog.Logger
+	onConnect        func(*Conn)
+	onDisconnect     func(*Conn)
 
 	handlerMu sync.RWMutex
 	handlers  map[string]handler
@@ -42,13 +50,18 @@ type Server struct {
 	listener   net.Listener
 
 	connMu sync.Mutex
-	conns  map[*serverConn]struct{}
+	conns  map[*Conn]struct{}
 
 	shuttingDown atomic.Bool
 	wg           sync.WaitGroup
 }
 
 type handler func(*Context, []byte) ([]byte, error)
+
+type handlerRegistrar interface {
+	handlerCodec() Codec
+	registerHandler(function string, h handler) error
+}
 
 // NewServer creates a Server with default codec and limits where options are unset.
 func NewServer(opts ServerOptions) *Server {
@@ -57,24 +70,43 @@ func NewServer(opts ServerOptions) *Server {
 		maxFrameSize:     normalizeMaxFrameSize(opts.MaxFrameSize),
 		handshakeTimeout: normalizeHandshakeTimeout(opts.HandshakeTimeout),
 		auth:             opts.Auth,
+		writeTimeout:     normalizeWriteTimeout(opts.WriteTimeout),
 		logger:           opts.Logger,
+		onConnect:        opts.OnConnect,
+		onDisconnect:     opts.OnDisconnect,
 		handlers:         make(map[string]handler),
-		conns:            make(map[*serverConn]struct{}),
+		conns:            make(map[*Conn]struct{}),
 	}
 }
 
-// Register binds a typed unary handler to a function name.
-func Register[Req, Resp any](s *Server, function string, fn HandlerFunc[Req, Resp]) error {
-	if s == nil {
+// Register binds a typed unary handler to a function name. The target can be a
+// *Server, for functions the accepted side handles, or a *Client, for functions
+// the dialing side handles after the connection is established.
+func Register[Req, Resp any](target any, function string, fn HandlerFunc[Req, Resp]) error {
+	if target == nil {
 		return ErrClosed
 	}
 	if function == "" || fn == nil {
 		return ErrInvalidFunction
 	}
 
+	registrar, ok := target.(handlerRegistrar)
+	if !ok {
+		return ErrInvalidHandler
+	}
+
+	codec := registrar.handlerCodec()
+	if codec == nil {
+		return ErrClosed
+	}
+
+	return registrar.registerHandler(function, wrapHandler(codec, fn))
+}
+
+func wrapHandler[Req, Resp any](codec Codec, fn HandlerFunc[Req, Resp]) handler {
 	wrapped := func(ctx *Context, payload []byte) ([]byte, error) {
 		var req Req
-		if err := s.codec.Unmarshal(payload, &req); err != nil {
+		if err := codec.Unmarshal(payload, &req); err != nil {
 			return nil, NewRemoteError(ErrorCodeInvalidRequest, fmt.Sprintf("decode request: %v", err), nil)
 		}
 
@@ -83,7 +115,7 @@ func Register[Req, Resp any](s *Server, function string, fn HandlerFunc[Req, Res
 			return nil, err
 		}
 
-		data, err := s.codec.Marshal(resp)
+		data, err := codec.Marshal(resp)
 		if err != nil {
 			return nil, fmt.Errorf("encode response: %w", err)
 		}
@@ -91,20 +123,42 @@ func Register[Req, Resp any](s *Server, function string, fn HandlerFunc[Req, Res
 		return data, nil
 	}
 
+	return wrapped
+}
+
+func (s *Server) registerHandler(function string, h handler) error {
+	if s == nil {
+		return ErrClosed
+	}
+	if function == "" || h == nil {
+		return ErrInvalidFunction
+	}
+
 	s.handlerMu.Lock()
 	defer s.handlerMu.Unlock()
 
+	if s.handlers == nil {
+		s.handlers = make(map[string]handler)
+	}
 	if _, exists := s.handlers[function]; exists {
 		return ErrDuplicateFunction
 	}
-	s.handlers[function] = wrapped
+	s.handlers[function] = h
 
 	return nil
 }
 
+func (s *Server) handlerCodec() Codec {
+	if s == nil {
+		return nil
+	}
+
+	return s.codec
+}
+
 // MustRegister is Register that panics on error.
-func MustRegister[Req, Resp any](s *Server, function string, fn HandlerFunc[Req, Resp]) {
-	if err := Register(s, function, fn); err != nil {
+func MustRegister[Req, Resp any](target any, function string, fn HandlerFunc[Req, Resp]) {
+	if err := Register(target, function, fn); err != nil {
 		panic(err)
 	}
 }
@@ -201,7 +255,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) serveConn(conn net.Conn) {
-	sc := newServerConn(s, conn)
+	sc := newConn(s, conn)
 	s.addConn(sc)
 	defer func() {
 		s.removeConn(sc)
@@ -214,6 +268,8 @@ func (s *Server) serveConn(conn net.Conn) {
 		return
 	}
 	sc.clientName = clientName
+	go s.safeOnConnect(sc)
+	defer s.safeOnDisconnect(sc)
 
 	for {
 		frame, err := readFrame(conn, s.maxFrameSize, s.codec)
@@ -221,12 +277,17 @@ func (s *Server) serveConn(conn net.Conn) {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				s.logDebug("gorpc read failed", "error", err)
 			}
+			sc.closeWithError(fmt.Errorf("%w: %v", ErrUnavailable, err))
 			return
 		}
 
 		switch frame.Type {
 		case FrameRequest:
 			sc.startRequest(frame)
+		case FrameResponse, FrameError:
+			if !sc.complete(frame.RequestID, clientResponse{frame: frame}) {
+				s.logDebug("gorpc discarded response for unknown request", "request_id", frame.RequestID)
+			}
 		case FrameCancel:
 			sc.cancel(frame.RequestID)
 		case FramePing:
@@ -387,18 +448,61 @@ func (s *Server) clearListener(ln net.Listener) {
 	}
 }
 
-func (s *Server) addConn(conn *serverConn) {
+// Connections returns a snapshot of currently accepted connections.
+func (s *Server) Connections() []*Conn {
+	if s == nil {
+		return nil
+	}
+
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+
+	conns := make([]*Conn, 0, len(s.conns))
+	for conn := range s.conns {
+		conns = append(conns, conn)
+	}
+
+	return conns
+}
+
+func (s *Server) addConn(conn *Conn) {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
 
 	s.conns[conn] = struct{}{}
 }
 
-func (s *Server) removeConn(conn *serverConn) {
+func (s *Server) removeConn(conn *Conn) {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
 
 	delete(s.conns, conn)
+}
+
+func (s *Server) safeOnConnect(conn *Conn) {
+	if s == nil || s.onConnect == nil {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logDebug("gorpc on connect panic", "panic", recovered)
+		}
+	}()
+
+	s.onConnect(conn)
+}
+
+func (s *Server) safeOnDisconnect(conn *Conn) {
+	if s == nil || s.onDisconnect == nil {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logDebug("gorpc on disconnect panic", "panic", recovered)
+		}
+	}()
+
+	s.onDisconnect(conn)
 }
 
 func (s *Server) logDebug(msg string, args ...any) {
@@ -407,26 +511,193 @@ func (s *Server) logDebug(msg string, args ...any) {
 	}
 }
 
-type serverConn struct {
+// Conn is one accepted GoRPC connection. A Conn can receive requests through
+// server-registered functions and can also initiate requests back to the client
+// over the same full-duplex connection.
+type Conn struct {
 	server     *Server
 	conn       net.Conn
 	clientName string
 
+	nextID  atomic.Uint64
 	writeMu sync.Mutex
+
+	pendingMu sync.Mutex
+	pending   map[uint64]pendingCall
 
 	requestMu sync.Mutex
 	requests  map[uint64]context.CancelFunc
+
+	closeOnce  sync.Once
+	closed     chan struct{}
+	closeErrMu sync.Mutex
+	closeErr   error
 }
 
-func newServerConn(server *Server, conn net.Conn) *serverConn {
-	return &serverConn{
+func newConn(server *Server, conn net.Conn) *Conn {
+	return &Conn{
 		server:   server,
 		conn:     conn,
+		pending:  make(map[uint64]pendingCall),
 		requests: make(map[uint64]context.CancelFunc),
+		closed:   make(chan struct{}),
 	}
 }
 
-func (c *serverConn) startRequest(frame Frame) {
+// ClientName returns the self-reported client name from the connection
+// handshake. It is useful for logs and metrics, but is not authenticated.
+func (c *Conn) ClientName() string {
+	if c == nil {
+		return ""
+	}
+
+	return c.clientName
+}
+
+// RemoteAddr returns the peer address for the connection.
+func (c *Conn) RemoteAddr() net.Addr {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+
+	return c.conn.RemoteAddr()
+}
+
+// LocalAddr returns the local address for the connection.
+func (c *Conn) LocalAddr() net.Addr {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+
+	return c.conn.LocalAddr()
+}
+
+// Call performs a unary request/response call to the connected client.
+func (c *Conn) Call(function string, req any, resp any) error {
+	return c.CallContext(context.Background(), function, req, resp)
+}
+
+// CallWithTimeout performs a unary request/response call to the connected
+// client with a timeout.
+func (c *Conn) CallWithTimeout(function string, req any, resp any, timeout time.Duration) error {
+	if timeout <= 0 {
+		return c.Call(function, req, resp)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	return c.CallContext(ctx, function, req, resp)
+}
+
+// CallContext performs a unary request/response call to the connected client.
+func (c *Conn) CallContext(ctx context.Context, function string, req any, resp any) error {
+	if c == nil {
+		return ErrClosed
+	}
+	ctx = normalizeContext(ctx)
+	if err := validateResponseTarget(resp); err != nil {
+		return err
+	}
+
+	responseCh := make(chan clientResponse, 1)
+	requestID, err := c.sendRequest(ctx, function, req, syncPendingCall{ch: responseCh})
+	if err != nil {
+		return err
+	}
+
+	select {
+	case response := <-responseCh:
+		if response.err != nil {
+			return response.err
+		}
+
+		return decodeResponse(c.server.codec, response.frame, resp)
+	case <-ctx.Done():
+		c.removePending(requestID)
+		_ = c.write(Frame{Type: FrameCancel, RequestID: requestID})
+		return ctx.Err()
+	case <-c.closed:
+		c.removePending(requestID)
+		return c.closedError()
+	}
+}
+
+// AsyncCall sends a unary request to the connected client and invokes handler
+// when the response arrives.
+func (c *Conn) AsyncCall(function string, req any, handler any, correlationID string) error {
+	return c.AsyncCallContext(context.Background(), function, req, handler, correlationID)
+}
+
+// AsyncCallWithTimeout sends a unary request to the connected client using a
+// timeout while writing the request frame. The response handler runs later.
+func (c *Conn) AsyncCallWithTimeout(function string, req any, handler any, correlationID string, timeout time.Duration) error {
+	if timeout <= 0 {
+		return c.AsyncCall(function, req, handler, correlationID)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	return c.AsyncCallContext(ctx, function, req, handler, correlationID)
+}
+
+// AsyncCallContext sends a unary request to the connected client and invokes
+// handler when the response arrives.
+func (c *Conn) AsyncCallContext(ctx context.Context, function string, req any, handler any, correlationID string) error {
+	if c == nil {
+		return ErrClosed
+	}
+	ctx = normalizeContext(ctx)
+
+	pending, err := newAsyncPendingCall(function, correlationID, handler)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.sendRequest(ctx, function, req, pending)
+	return err
+}
+
+func (c *Conn) sendRequest(ctx context.Context, function string, req any, pending pendingCall) (uint64, error) {
+	ctx = normalizeContext(ctx)
+	if c == nil || c.server == nil {
+		return 0, ErrClosed
+	}
+	if function == "" {
+		return 0, ErrInvalidFunction
+	}
+
+	payload, err := c.server.codec.Marshal(req)
+	if err != nil {
+		return 0, fmt.Errorf("encode request: %w", err)
+	}
+
+	requestID := c.nextID.Add(1)
+	if err := c.addPending(requestID, pending); err != nil {
+		return 0, err
+	}
+
+	frame := Frame{
+		Type:      FrameRequest,
+		RequestID: requestID,
+		Function:  function,
+		Payload:   payload,
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		frame.DeadlineUnixNano = deadline.UnixNano()
+	}
+
+	if err := c.write(frame); err != nil {
+		c.removePending(requestID)
+		c.closeWithError(err)
+		return 0, err
+	}
+
+	return requestID, nil
+}
+
+func (c *Conn) startRequest(frame Frame) {
 	if frame.RequestID == 0 {
 		_ = c.writeError(frame, RemoteError{
 			Code:    ErrorCodeInvalidRequest,
@@ -467,6 +738,7 @@ func (c *serverConn) startRequest(frame Frame) {
 		function:   frame.Function,
 		remoteAddr: c.conn.RemoteAddr(),
 		localAddr:  c.conn.LocalAddr(),
+		conn:       c,
 	}
 
 	c.requestMu.Lock()
@@ -502,7 +774,7 @@ func (c *serverConn) startRequest(frame Frame) {
 	}()
 }
 
-func (c *serverConn) cancel(requestID uint64) {
+func (c *Conn) cancel(requestID uint64) {
 	c.requestMu.Lock()
 	cancel := c.requests[requestID]
 	c.requestMu.Unlock()
@@ -512,7 +784,7 @@ func (c *serverConn) cancel(requestID uint64) {
 	}
 }
 
-func (c *serverConn) writeError(request Frame, remoteErr RemoteError) error {
+func (c *Conn) writeError(request Frame, remoteErr RemoteError) error {
 	payload, err := c.server.codec.Marshal(remoteErr)
 	if err != nil {
 		return err
@@ -526,22 +798,173 @@ func (c *serverConn) writeError(request Frame, remoteErr RemoteError) error {
 	})
 }
 
-func (c *serverConn) write(frame Frame) error {
+func (c *Conn) write(frame Frame) error {
+	select {
+	case <-c.closed:
+		return c.closedError()
+	default:
+	}
+
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+
+	select {
+	case <-c.closed:
+		return c.closedError()
+	default:
+	}
+
+	if c.server.writeTimeout > 0 {
+		if err := c.conn.SetWriteDeadline(time.Now().Add(c.server.writeTimeout)); err != nil {
+			return fmt.Errorf("set write deadline: %w", err)
+		}
+		defer func() {
+			_ = c.conn.SetWriteDeadline(time.Time{})
+		}()
+	}
 
 	return writeFrame(c.conn, c.server.maxFrameSize, c.server.codec, frame)
 }
 
-func (c *serverConn) close() error {
-	c.requestMu.Lock()
-	for _, cancel := range c.requests {
-		cancel()
+func (c *Conn) addPending(requestID uint64, pending pendingCall) error {
+	select {
+	case <-c.closed:
+		return c.closedError()
+	default:
 	}
-	c.requests = make(map[uint64]context.CancelFunc)
-	c.requestMu.Unlock()
 
-	return c.conn.Close()
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+
+	select {
+	case <-c.closed:
+		return c.closedError()
+	default:
+		c.pending[requestID] = pending
+		return nil
+	}
+}
+
+func (c *Conn) removePending(requestID uint64) {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+
+	delete(c.pending, requestID)
+}
+
+func (c *Conn) complete(requestID uint64, response clientResponse) bool {
+	c.pendingMu.Lock()
+	pending := c.pending[requestID]
+	if pending != nil {
+		delete(c.pending, requestID)
+	}
+	c.pendingMu.Unlock()
+
+	if pending == nil {
+		return false
+	}
+
+	c.deliverPending(requestID, pending, response)
+	return true
+}
+
+func (c *Conn) failPending(err error) {
+	if err == nil {
+		err = ErrUnavailable
+	}
+
+	c.pendingMu.Lock()
+	pendingCalls := make(map[uint64]pendingCall, len(c.pending))
+	for requestID, pending := range c.pending {
+		delete(c.pending, requestID)
+		pendingCalls[requestID] = pending
+	}
+	c.pendingMu.Unlock()
+
+	for requestID, pending := range pendingCalls {
+		c.deliverPending(requestID, pending, clientResponse{err: err})
+	}
+}
+
+func (c *Conn) deliverPending(requestID uint64, pending pendingCall, response clientResponse) {
+	switch call := pending.(type) {
+	case syncPendingCall:
+		call.ch <- response
+	case asyncPendingCall:
+		go c.invokeAsyncHandler(requestID, call, response)
+	}
+}
+
+func (c *Conn) invokeAsyncHandler(requestID uint64, pending asyncPendingCall, response clientResponse) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			c.server.logDebug("gorpc async handler panic", "function", pending.function, "request_id", requestID, "panic", recovered)
+		}
+	}()
+
+	resp := reflect.New(pending.responseType.Elem())
+	err := response.err
+	if err == nil {
+		err = decodeResponse(c.server.codec, response.frame, resp.Interface())
+	}
+
+	ctx := &clientContext{
+		correlationID: pending.correlationID,
+		requestID:     requestID,
+		function:      pending.function,
+		err:           err,
+	}
+
+	pending.handler.Call([]reflect.Value{
+		reflect.ValueOf(ctx),
+		resp,
+	})
+}
+
+// Close closes the accepted connection, cancels active inbound handlers, and
+// fails pending outbound calls.
+func (c *Conn) Close() error {
+	return c.close()
+}
+
+func (c *Conn) close() error {
+	c.closeWithError(ErrClosed)
+	return nil
+}
+
+func (c *Conn) closeWithError(err error) {
+	if err == nil {
+		err = ErrClosed
+	}
+
+	c.closeOnce.Do(func() {
+		c.closeErrMu.Lock()
+		c.closeErr = err
+		c.closeErrMu.Unlock()
+
+		close(c.closed)
+
+		c.requestMu.Lock()
+		for _, cancel := range c.requests {
+			cancel()
+		}
+		c.requests = make(map[uint64]context.CancelFunc)
+		c.requestMu.Unlock()
+
+		_ = c.conn.Close()
+		c.failPending(err)
+	})
+}
+
+func (c *Conn) closedError() error {
+	c.closeErrMu.Lock()
+	defer c.closeErrMu.Unlock()
+
+	if c.closeErr == nil {
+		return ErrClosed
+	}
+
+	return c.closeErr
 }
 
 func normalizeHandshakeTimeout(timeout time.Duration) time.Duration {

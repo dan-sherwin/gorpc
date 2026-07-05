@@ -11,12 +11,12 @@ This is meant to keep the useful shape of `net/rpc` without inheriting gob as th
 ## Current Scope
 
 - TCP listener/client
-- Long-lived full-duplex client connection
+- Long-lived full-duplex peer connection after the client dials and the server accepts
 - Automatic client reconnect with exponential backoff
 - Ping/pong connection monitoring
 - Length-prefixed MessagePack frames
 - Shared Go request/response structs
-- Synchronous and asynchronous unary request/response calls
+- Synchronous and asynchronous unary request/response calls from either side
 - Request IDs in every request/response frame
 - Context deadline propagation and best-effort cancel frames
 - Client-side correlation IDs for asynchronous callbacks
@@ -30,7 +30,9 @@ This is meant to keep the useful shape of `net/rpc` without inheriting gob as th
 
 `Server.ServeTCP`, `Server.ServeUnix`, and `Server.ServeUnixPacket` cover the common listener cases. `Server.ServeListener` accepts any existing `net.Listener`.
 
-`TCPDial`, `UnixDial`, and `UnixPacketDial` establish the first connection, then the returned client keeps monitoring and reconnecting until `Close` is called. Reconnect attempts are intentionally aggressive: quick retry, exponential backoff capped at seconds, jitter, explicit dial timeouts, write deadlines, and ping/pong stale-connection detection. The lower-level `Dial` accepts a context, network, address, and full `ClientOptions` when you need explicit startup control. `Client.Call`, `Client.CallWithTimeout`, and `Client.CallContext` cover synchronous calls. `Client.AsyncCall` sends the request and invokes a typed callback when the response arrives. Calls made while disconnected wait for the next connection; timeout/context variants bound that wait. Calls already in flight when a connection drops fail with `ErrUnavailable`; GoRPC does not silently replay them because the server may already have processed the request.
+The words server and client only describe who accepts the connection and who initiates it. Once connected, both sides can register functions, send requests, receive responses, and handle incoming requests over the same full-duplex connection.
+
+`TCPDial`, `UnixDial`, and `UnixPacketDial` establish the first connection, then the returned client keeps monitoring and reconnecting until `Close` is called. Reconnect attempts are intentionally aggressive: quick retry, exponential backoff capped at seconds, jitter, explicit dial timeouts, write deadlines, and ping/pong stale-connection detection. The lower-level `Dial` accepts a context, network, address, and full `ClientOptions` when you need explicit startup control. Use `NewTCPClient`, `NewUnixClient`, or `NewUnixPacketClient` when the dialing side needs to register functions before connecting. `Client.Call`, `Client.CallWithTimeout`, and `Client.CallContext` cover synchronous calls. `Client.AsyncCall` sends the request and invokes a typed callback when the response arrives. Calls made while disconnected wait for the next connection; timeout/context variants bound that wait. Calls already in flight when a connection drops fail with `ErrUnavailable`; GoRPC does not silently replay them because the remote side may already have processed the request.
 
 Streaming, service discovery, pub/sub, load balancing, and generated code are intentionally out of v1.
 
@@ -66,6 +68,7 @@ package main
 
 import (
 	"log"
+	"time"
 
 	"github.com/dan-sherwin/gorpc"
 )
@@ -79,6 +82,14 @@ type GetItemResponse struct {
 	Name string
 }
 
+type ClientNoteRequest struct {
+	ItemID string
+}
+
+type ClientNoteResponse struct {
+	Note string
+}
+
 func getItem(ctx *gorpc.Context, req GetItemRequest) (GetItemResponse, error) {
 	log.Printf("handling %s request_id=%d client=%q remote=%s",
 		ctx.Function(),
@@ -86,6 +97,11 @@ func getItem(ctx *gorpc.Context, req GetItemRequest) (GetItemResponse, error) {
 		ctx.ClientName(),
 		ctx.RemoteAddr(),
 	)
+
+	var note ClientNoteResponse
+	if err := ctx.CallWithTimeout("client_note", ClientNoteRequest{ItemID: req.ID}, &note, time.Second); err == nil {
+		log.Printf("client note: %s", note.Note)
+	}
 
 	return GetItemResponse{
 		ID:   req.ID,
@@ -111,6 +127,7 @@ Client app:
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -127,9 +144,19 @@ type GetItemResponse struct {
 	Name string
 }
 
+type ClientNoteRequest struct {
+	ItemID string
+}
+
+type ClientNoteResponse struct {
+	Note string
+}
+
 func main() {
-	client, err := gorpc.TCPDial("127.0.0.1:9070", "inventory-example-client")
-	if err != nil {
+	client := gorpc.NewTCPClient("127.0.0.1:9070", "inventory-example-client")
+	gorpc.MustRegister(client, "client_note", clientNote)
+
+	if err := client.Connect(context.Background()); err != nil {
 		log.Fatal(err)
 	}
 	defer func() {
@@ -142,6 +169,10 @@ func main() {
 	}
 
 	fmt.Printf("%s: %s\n", item.ID, item.Name)
+}
+
+func clientNote(_ *gorpc.Context, req ClientNoteRequest) (ClientNoteResponse, error) {
+	return ClientNoteResponse{Note: "client saw request for " + req.ItemID}, nil
 }
 ```
 
@@ -160,6 +191,8 @@ if err := client.AsyncCall("get_an_item", GetItemRequest{ID: "widget-async"}, ha
 	log.Fatal(err)
 }
 ```
+
+For server-initiated calls outside an existing request handler, use `ServerOptions.OnConnect` or `server.Connections()` to get a `*gorpc.Conn`, then call `conn.Call`, `conn.CallWithTimeout`, or `conn.AsyncCall`.
 
 ## Runnable Example
 

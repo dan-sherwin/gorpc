@@ -3,8 +3,8 @@
 This example shows the intended GoRPC shape:
 
 - a server app with request/response types, handler registration, and a `main`
-- a client app with matching request/response types, synchronous calls, asynchronous callbacks, and a `main`
-- one long-lived TCP connection carrying typed unary calls
+- a client app with matching request/response types, client-side handler registration, synchronous calls, asynchronous callbacks, and a `main`
+- one long-lived TCP connection carrying typed unary calls in both directions
 - automatic client reconnect if that connection drops
 - request metadata available through `*gorpc.Context`
 - response metadata available through `gorpc.ClientContext`
@@ -30,4 +30,4 @@ In another terminal, run the client:
 go run ./examples/inventory/client
 ```
 
-The client fetches `widget-001` synchronously, fetches `widget-async` asynchronously, then intentionally requests `missing-item` so you can see a structured remote error come back.
+The client registers `client_note` before connecting. The server calls that client function while handling `get_an_item`, then the client fetches `widget-001` synchronously, fetches `widget-async` asynchronously, and intentionally requests `missing-item` so you can see a structured remote error come back.

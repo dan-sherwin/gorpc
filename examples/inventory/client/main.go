@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -19,12 +20,22 @@ type GetItemResponse struct {
 	Name string
 }
 
+type ClientNoteRequest struct {
+	ItemID string
+}
+
+type ClientNoteResponse struct {
+	Note string
+}
+
 func main() {
 	const addr = "127.0.0.1:9070"
 	const itemID = "widget-001"
 
-	client, err := gorpc.TCPDial(addr, "inventory-example-client")
-	if err != nil {
+	client := gorpc.NewTCPClient(addr, "inventory-example-client")
+	gorpc.MustRegister(client, "client_note", clientNote)
+
+	if err := client.Connect(context.Background()); err != nil {
 		log.Fatal(err)
 	}
 	defer func() {
@@ -34,6 +45,10 @@ func main() {
 	getItemSync(client, itemID)
 	getItemAsync(client, "widget-async", "example-async-1")
 	getMissingItemSync(client)
+}
+
+func clientNote(_ *gorpc.Context, req ClientNoteRequest) (ClientNoteResponse, error) {
+	return ClientNoteResponse{Note: "client saw request for " + req.ItemID}, nil
 }
 
 func getItemSync(client *gorpc.Client, itemID string) {

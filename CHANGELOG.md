@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [v0.3.0] - 2026-07-05
+### Added
+- Added bidirectional unary requests over an established connection: both sides can register functions, send requests, and receive responses.
+- Added `NewClient`, `NewTCPClient`, `NewUnixClient`, and `NewUnixPacketClient` so the dialing side can register handlers before connecting.
+- Added accepted connection APIs through `*gorpc.Conn`, `ServerOptions.OnConnect`, `ServerOptions.OnDisconnect`, `Server.Connections`, and `Context.Conn`.
+
 ## [v0.2.0] - 2026-06-25
 ### Changed
 - Replaced service/method routing with a single function name in `Register`, `MustRegister`, `Call`, `Function`, and request/response frames.
@@ -37,5 +43,6 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Optional `slog` debug logging hooks.
 - CI workflow covering tidy, build, vet, race tests, lint, and govulncheck.
 
+[v0.3.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.3.0
 [v0.2.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.2.0
 [v0.1.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.1.0

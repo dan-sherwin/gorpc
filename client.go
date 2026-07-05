@@ -43,8 +43,9 @@ type ClientOptions struct {
 	PingTimeout       time.Duration
 }
 
-// Client is a long-lived full-duplex connection to a GoRPC server. It reconnects
-// automatically after connection loss until Close is called.
+// Client is the dialing side of a long-lived full-duplex GoRPC connection. It
+// can send requests, register functions for the accepted side to call, and
+// reconnects automatically after connection loss until Close is called.
 type Client struct {
 	network string
 	address string
@@ -69,6 +70,9 @@ type Client struct {
 
 	writeMu sync.Mutex
 
+	handlerMu sync.RWMutex
+	handlers  map[string]handler
+
 	connMu sync.Mutex
 	conn   net.Conn
 	ready  chan struct{}
@@ -76,9 +80,13 @@ type Client struct {
 	lastFrameUnixNano atomic.Int64
 
 	reconnectCh chan struct{}
+	startOnce   sync.Once
 
 	pendingMu sync.Mutex
 	pending   map[uint64]pendingCall
+
+	requestMu sync.Mutex
+	requests  map[uint64]context.CancelFunc
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -105,7 +113,8 @@ type asyncPendingCall struct {
 	responseType  reflect.Type
 }
 
-// ClientContext is passed to asynchronous response handlers.
+// ClientContext is passed to asynchronous response handlers for requests made
+// by either a Client or an accepted Conn.
 type ClientContext interface {
 	CorrelationID() string
 	RequestID() uint64
@@ -138,12 +147,9 @@ func (c *clientContext) Error() error {
 	return c.err
 }
 
-// Dial connects to a GoRPC server, completes the protocol handshake, and starts
-// background reconnect monitoring.
-func Dial(ctx context.Context, network, address string, opts ClientOptions) (*Client, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+// NewClient creates a client without connecting it. Use this when the dialing
+// side needs to register functions before the accepted side can call them.
+func NewClient(network, address string, opts ClientOptions) *Client {
 	if network == "" {
 		network = "tcp"
 	}
@@ -172,15 +178,48 @@ func Dial(ctx context.Context, network, address string, opts ClientOptions) (*Cl
 		pingTimeout:       normalizePingTimeout(opts.PingTimeout),
 		ready:             make(chan struct{}),
 		reconnectCh:       make(chan struct{}, 1),
+		handlers:          make(map[string]handler),
 		pending:           make(map[uint64]pendingCall),
+		requests:          make(map[uint64]context.CancelFunc),
 		closed:            make(chan struct{}),
 	}
 
-	if err := client.connectUntilReady(ctx); err != nil {
+	return client
+}
+
+// NewTCPClient creates a TCP client without connecting it.
+func NewTCPClient(address, clientName string, opts ...ClientOptions) *Client {
+	return newClientWithOptions("tcp", address, clientName, opts...)
+}
+
+// NewUnixClient creates a Unix socket client without connecting it.
+func NewUnixClient(path, clientName string, opts ...ClientOptions) *Client {
+	return newClientWithOptions("unix", path, clientName, opts...)
+}
+
+// NewUnixPacketClient creates a Unix packet socket client without connecting it.
+func NewUnixPacketClient(path, clientName string, opts ...ClientOptions) *Client {
+	return newClientWithOptions("unixpacket", path, clientName, opts...)
+}
+
+func newClientWithOptions(network, address, clientName string, opts ...ClientOptions) *Client {
+	options := ClientOptions{}
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	options.ClientName = clientName
+
+	return NewClient(network, address, options)
+}
+
+// Dial connects to a GoRPC server, completes the protocol handshake, and starts
+// background reconnect monitoring.
+func Dial(ctx context.Context, network, address string, opts ClientOptions) (*Client, error) {
+	client := NewClient(network, address, opts)
+
+	if err := client.Connect(ctx); err != nil {
 		return nil, err
 	}
-
-	go client.reconnectLoop()
 
 	return client, nil
 }
@@ -250,7 +289,7 @@ func (c *Client) CallContext(ctx context.Context, function string, req any, resp
 			return response.err
 		}
 
-		return c.decodeResponse(response.frame, resp)
+		return decodeResponse(c.codec, response.frame, resp)
 	case <-ctx.Done():
 		c.removePending(requestID)
 		if conn, ok := c.currentConn(); ok {
@@ -363,22 +402,32 @@ func (c *Client) sendRequest(ctx context.Context, function string, req any, pend
 	return requestID, nil
 }
 
-func (c *Client) decodeResponse(frame Frame, resp any) error {
+func decodeResponse(codec Codec, frame Frame, resp any) error {
+	codec = defaultCodec(codec)
+
 	switch frame.Type {
 	case FrameResponse:
-		if err := c.codec.Unmarshal(frame.Payload, resp); err != nil {
+		if err := codec.Unmarshal(frame.Payload, resp); err != nil {
 			return fmt.Errorf("decode response: %w", err)
 		}
 		return nil
 	case FrameError:
 		var remoteErr RemoteError
-		if err := c.codec.Unmarshal(frame.Payload, &remoteErr); err != nil {
+		if err := codec.Unmarshal(frame.Payload, &remoteErr); err != nil {
 			return fmt.Errorf("decode remote error: %w", err)
 		}
 		return &remoteErr
 	default:
 		return fmt.Errorf("%w: unexpected response frame %s", ErrProtocol, frame.Type.String())
 	}
+}
+
+func (c *Client) decodeResponse(frame Frame, resp any) error {
+	if c == nil {
+		return ErrClosed
+	}
+
+	return decodeResponse(c.codec, frame, resp)
 }
 
 func newAsyncPendingCall(function, correlationID string, handler any) (asyncPendingCall, error) {
@@ -426,12 +475,76 @@ func validateResponseTarget(resp any) error {
 	return nil
 }
 
+func (c *Client) registerHandler(function string, h handler) error {
+	if c == nil {
+		return ErrClosed
+	}
+	if function == "" || h == nil {
+		return ErrInvalidFunction
+	}
+
+	c.handlerMu.Lock()
+	defer c.handlerMu.Unlock()
+
+	if c.handlers == nil {
+		c.handlers = make(map[string]handler)
+	}
+	if _, exists := c.handlers[function]; exists {
+		return ErrDuplicateFunction
+	}
+	c.handlers[function] = h
+
+	return nil
+}
+
+func (c *Client) handlerCodec() Codec {
+	if c == nil {
+		return nil
+	}
+
+	return c.codec
+}
+
+func (c *Client) findHandler(function string) handler {
+	c.handlerMu.RLock()
+	defer c.handlerMu.RUnlock()
+
+	return c.handlers[function]
+}
+
 func normalizeContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		return context.Background()
 	}
 
 	return ctx
+}
+
+// Connect establishes the first connection and starts background reconnect
+// monitoring. It is called automatically by Dial and the TCPDial helpers.
+func (c *Client) Connect(ctx context.Context) error {
+	if c == nil {
+		return ErrClosed
+	}
+	ctx = normalizeContext(ctx)
+
+	if _, ok := c.currentConn(); ok {
+		c.startReconnectLoop()
+		return nil
+	}
+
+	if err := c.connectUntilReady(ctx); err != nil {
+		return err
+	}
+	c.startReconnectLoop()
+
+	return nil
+}
+
+func (c *Client) startReconnectLoop() {
+	c.startOnce.Do(func() {
+		go c.reconnectLoop()
+	})
 }
 
 // WaitReady blocks until the client has an active connection or ctx is canceled.
@@ -720,10 +833,14 @@ func (c *Client) readLoop(conn net.Conn) {
 		c.lastFrameUnixNano.Store(time.Now().UnixNano())
 
 		switch frame.Type {
+		case FrameRequest:
+			c.startRequest(conn, frame)
 		case FrameResponse, FrameError:
 			if !c.complete(frame.RequestID, clientResponse{frame: frame}) {
 				c.logDebug("gorpc discarded response for unknown request", "request_id", frame.RequestID)
 			}
+		case FrameCancel:
+			c.cancel(frame.RequestID)
 		case FramePing:
 			if err := c.writeTo(conn, Frame{Type: FramePong, RequestID: frame.RequestID}); err != nil {
 				c.connectionLost(conn, err)
@@ -734,6 +851,105 @@ func (c *Client) readLoop(conn net.Conn) {
 			c.logDebug("gorpc ignored frame", "type", frame.Type.String(), "request_id", frame.RequestID)
 		}
 	}
+}
+
+func (c *Client) startRequest(conn net.Conn, frame Frame) {
+	if frame.RequestID == 0 {
+		_ = c.writeErrorTo(conn, frame, RemoteError{
+			Code:    ErrorCodeInvalidRequest,
+			Message: "request_id is required",
+		})
+		return
+	}
+	if frame.Function == "" {
+		_ = c.writeErrorTo(conn, frame, RemoteError{
+			Code:    ErrorCodeInvalidRequest,
+			Message: "function is required",
+		})
+		return
+	}
+
+	h := c.findHandler(frame.Function)
+	if h == nil {
+		_ = c.writeErrorTo(conn, frame, RemoteError{
+			Code:    ErrorCodeNotFound,
+			Message: fmt.Sprintf("function %q is not registered", frame.Function),
+		})
+		return
+	}
+
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if frame.DeadlineUnixNano > 0 {
+		deadline := time.Unix(0, frame.DeadlineUnixNano)
+		ctx, cancel = context.WithDeadline(context.Background(), deadline)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
+
+	rpcCtx := &Context{
+		Context:    ctx,
+		requestID:  frame.RequestID,
+		function:   frame.Function,
+		remoteAddr: conn.RemoteAddr(),
+		localAddr:  conn.LocalAddr(),
+	}
+
+	c.requestMu.Lock()
+	c.requests[frame.RequestID] = cancel
+	c.requestMu.Unlock()
+
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				_ = c.writeErrorTo(conn, frame, RemoteError{
+					Code:    ErrorCodeInternal,
+					Message: fmt.Sprintf("handler panic: %v", recovered),
+				})
+			}
+			cancel()
+			c.requestMu.Lock()
+			delete(c.requests, frame.RequestID)
+			c.requestMu.Unlock()
+		}()
+
+		payload, err := h(rpcCtx, frame.Payload)
+		if err != nil {
+			_ = c.writeErrorTo(conn, frame, remoteErrorFromError(err))
+			return
+		}
+
+		_ = c.writeTo(conn, Frame{
+			Type:      FrameResponse,
+			RequestID: frame.RequestID,
+			Function:  frame.Function,
+			Payload:   payload,
+		})
+	}()
+}
+
+func (c *Client) cancel(requestID uint64) {
+	c.requestMu.Lock()
+	cancel := c.requests[requestID]
+	c.requestMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (c *Client) writeErrorTo(conn net.Conn, request Frame, remoteErr RemoteError) error {
+	payload, err := c.codec.Marshal(remoteErr)
+	if err != nil {
+		return err
+	}
+
+	return c.writeTo(conn, Frame{
+		Type:      FrameError,
+		RequestID: request.RequestID,
+		Function:  request.Function,
+		Payload:   payload,
+	})
 }
 
 func (c *Client) pingLoop(conn net.Conn) {
@@ -794,6 +1010,7 @@ func (c *Client) connectionLost(conn net.Conn, err error) {
 	c.connMu.Unlock()
 
 	_ = conn.Close()
+	c.cancelRequests()
 	c.failPending(fmt.Errorf("%w: %v", ErrUnavailable, err))
 	c.signalReconnect()
 }
@@ -954,6 +1171,7 @@ func (c *Client) closeWithError(err error) {
 		}
 		c.connMu.Unlock()
 
+		c.cancelRequests()
 		c.failPending(err)
 	})
 }
@@ -973,6 +1191,15 @@ func (c *Client) logDebug(msg string, args ...any) {
 	if c.logger != nil {
 		c.logger.Debug(msg, args...)
 	}
+}
+
+func (c *Client) cancelRequests() {
+	c.requestMu.Lock()
+	for _, cancel := range c.requests {
+		cancel()
+	}
+	c.requests = make(map[uint64]context.CancelFunc)
+	c.requestMu.Unlock()
 }
 
 func normalizeReconnectMinDelay(delay time.Duration) time.Duration {
