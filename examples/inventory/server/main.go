@@ -3,7 +3,6 @@ package main
 
 import (
 	"log"
-	"time"
 
 	"github.com/dan-sherwin/gorpc"
 )
@@ -17,12 +16,8 @@ type GetItemResponse struct {
 	Name string
 }
 
-type ClientNoteRequest struct {
+type ClientNote struct {
 	ItemID string
-}
-
-type ClientNoteResponse struct {
-	Note string
 }
 
 func getItem(ctx *gorpc.Context, req GetItemRequest) (GetItemResponse, error) {
@@ -39,11 +34,8 @@ func getItem(ctx *gorpc.Context, req GetItemRequest) (GetItemResponse, error) {
 		})
 	}
 
-	var note ClientNoteResponse
-	if err := ctx.CallWithTimeout("client_note", ClientNoteRequest{ItemID: req.ID}, &note, time.Second); err != nil {
-		log.Printf("client callback failed: %v", err)
-	} else {
-		log.Printf("client note: %s", note.Note)
+	if err := ctx.Notify("client_note", ClientNote{ItemID: req.ID}); err != nil {
+		log.Printf("client notification failed: %v", err)
 	}
 
 	return GetItemResponse{

@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [v0.4.0] - 2026-07-05
+### Added
+- Added one-way notifications over established connections with `RegisterNotify`, `MustRegisterNotify`, `Client.Notify`, `Conn.Notify`, and `Context.Notify`.
+
 ## [v0.3.0] - 2026-07-05
 ### Added
 - Added bidirectional unary requests over an established connection: both sides can register functions, send requests, and receive responses.
@@ -43,6 +47,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Optional `slog` debug logging hooks.
 - CI workflow covering tidy, build, vet, race tests, lint, and govulncheck.
 
+[v0.4.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.4.0
 [v0.3.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.3.0
 [v0.2.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.2.0
 [v0.1.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.1.0

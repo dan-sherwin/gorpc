@@ -20,6 +20,7 @@ const (
 	FrameStreamEnd
 	FrameAuth
 	FrameAuthAck
+	FrameNotify
 )
 
 func (t FrameType) String() string {
@@ -48,6 +49,8 @@ func (t FrameType) String() string {
 		return "auth"
 	case FrameAuthAck:
 		return "auth_ack"
+	case FrameNotify:
+		return "notify"
 	default:
 		return "unknown"
 	}

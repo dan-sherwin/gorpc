@@ -6,7 +6,8 @@ import (
 	"time"
 )
 
-// Context is the request-scoped context passed to server handlers.
+// Context is the message-scoped context passed to request and notification
+// handlers.
 type Context struct {
 	context.Context
 
@@ -16,6 +17,7 @@ type Context struct {
 	remoteAddr net.Addr
 	localAddr  net.Addr
 	conn       *Conn
+	notify     bool
 }
 
 var _ context.Context = (*Context)(nil)
@@ -30,7 +32,7 @@ func (c *Context) ClientName() string {
 	return c.clientName
 }
 
-// RequestID returns the request ID from the GoRPC frame.
+// RequestID returns the request or notification ID from the GoRPC frame.
 func (c *Context) RequestID() uint64 {
 	if c == nil {
 		return 0
@@ -46,6 +48,15 @@ func (c *Context) Function() string {
 	}
 
 	return c.function
+}
+
+// IsNotify reports whether the inbound message is a one-way notification.
+func (c *Context) IsNotify() bool {
+	if c == nil {
+		return false
+	}
+
+	return c.notify
 }
 
 // RemoteAddr returns the peer address for the connection.
@@ -105,4 +116,34 @@ func (c *Context) CallContext(ctx context.Context, function string, req any, res
 	}
 
 	return c.conn.CallContext(ctx, function, req, resp)
+}
+
+// Notify sends a one-way typed notification back over the same accepted
+// connection that delivered this request.
+func (c *Context) Notify(function string, req any) error {
+	if c == nil || c.conn == nil {
+		return ErrUnavailable
+	}
+
+	return c.conn.Notify(function, req)
+}
+
+// NotifyWithTimeout sends a one-way typed notification back over the same
+// accepted connection with a timeout while writing the notification frame.
+func (c *Context) NotifyWithTimeout(function string, req any, timeout time.Duration) error {
+	if c == nil || c.conn == nil {
+		return ErrUnavailable
+	}
+
+	return c.conn.NotifyWithTimeout(function, req, timeout)
+}
+
+// NotifyContext sends a one-way typed notification back over the same accepted
+// connection.
+func (c *Context) NotifyContext(ctx context.Context, function string, req any) error {
+	if c == nil || c.conn == nil {
+		return ErrUnavailable
+	}
+
+	return c.conn.NotifyContext(ctx, function, req)
 }

@@ -20,12 +20,8 @@ type GetItemResponse struct {
 	Name string
 }
 
-type ClientNoteRequest struct {
+type ClientNote struct {
 	ItemID string
-}
-
-type ClientNoteResponse struct {
-	Note string
 }
 
 func main() {
@@ -33,7 +29,7 @@ func main() {
 	const itemID = "widget-001"
 
 	client := gorpc.NewTCPClient(addr, "inventory-example-client")
-	gorpc.MustRegister(client, "client_note", clientNote)
+	gorpc.MustRegisterNotify(client, "client_note", clientNote)
 
 	if err := client.Connect(context.Background()); err != nil {
 		log.Fatal(err)
@@ -47,8 +43,9 @@ func main() {
 	getMissingItemSync(client)
 }
 
-func clientNote(_ *gorpc.Context, req ClientNoteRequest) (ClientNoteResponse, error) {
-	return ClientNoteResponse{Note: "client saw request for " + req.ItemID}, nil
+func clientNote(_ *gorpc.Context, note ClientNote) error {
+	fmt.Println("server push: client saw request for", note.ItemID)
+	return nil
 }
 
 func getItemSync(client *gorpc.Client, itemID string) {

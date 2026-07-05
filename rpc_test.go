@@ -27,6 +27,11 @@ type clientInfoResponse struct {
 	Message string
 }
 
+type itemChangedNotification struct {
+	ID   string
+	Name string
+}
+
 func TestUnaryRoundTrip(t *testing.T) {
 	server, address, shutdown := startTestServer(t)
 	defer shutdown()
@@ -49,6 +54,130 @@ func TestUnaryRoundTrip(t *testing.T) {
 	}
 	if resp.ID != "abc123" || resp.Name != "Widget Pack" {
 		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestNotifyClientToServer(t *testing.T) {
+	server, address, shutdown := startTestServer(t)
+	defer shutdown()
+
+	notifications := make(chan itemChangedNotification, 1)
+	MustRegisterNotify(server, "item_changed", func(ctx *Context, notification itemChangedNotification) error {
+		if !ctx.IsNotify() {
+			return errors.New("context did not mark notification")
+		}
+		if ctx.RequestID() == 0 {
+			return errors.New("notification request ID was not set")
+		}
+		if ctx.Function() != "item_changed" {
+			return errors.New("notification function was not set")
+		}
+
+		notifications <- notification
+		return nil
+	})
+
+	client, err := TCPDial(address, "notify-test-client", ClientOptions{
+		PingInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	if err := client.Notify("item_changed", itemChangedNotification{ID: "abc123", Name: "Widget Pack"}); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+
+	select {
+	case notification := <-notifications:
+		if notification.ID != "abc123" || notification.Name != "Widget Pack" {
+			t.Fatalf("notification = %+v", notification)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive notification")
+	}
+}
+
+func TestNotifyServerToClientFromHandler(t *testing.T) {
+	server, address, shutdown := startTestServer(t)
+	defer shutdown()
+
+	MustRegister(server, "get_an_item", func(ctx *Context, req getItemRequest) (getItemResponse, error) {
+		if err := ctx.Notify("item_changed", itemChangedNotification{ID: req.ID, Name: "server push"}); err != nil {
+			return getItemResponse{}, err
+		}
+
+		return getItemResponse{ID: req.ID, Name: "Widget Pack"}, nil
+	})
+
+	notifications := make(chan itemChangedNotification, 1)
+	client := NewTCPClient(address, "server-notify-handler-client", ClientOptions{
+		PingInterval: -1,
+	})
+	MustRegisterNotify(client, "item_changed", func(ctx *Context, notification itemChangedNotification) error {
+		if !ctx.IsNotify() {
+			return errors.New("context did not mark notification")
+		}
+		notifications <- notification
+		return nil
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	var resp getItemResponse
+	if err := client.Call("get_an_item", getItemRequest{ID: "abc123"}, &resp); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+
+	select {
+	case notification := <-notifications:
+		if notification.ID != "abc123" || notification.Name != "server push" {
+			t.Fatalf("notification = %+v", notification)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client did not receive notification")
+	}
+}
+
+func TestNotifyServerToClientOnConnect(t *testing.T) {
+	_, address, shutdown := startTestServerWithOptions(t, ServerOptions{
+		OnConnect: func(conn *Conn) {
+			_ = conn.NotifyWithTimeout("item_changed", itemChangedNotification{ID: "hello", Name: "from on connect"}, time.Second)
+		},
+	})
+	defer shutdown()
+
+	notifications := make(chan itemChangedNotification, 1)
+	client := NewTCPClient(address, "server-notify-connect-client", ClientOptions{
+		PingInterval: -1,
+	})
+	MustRegisterNotify(client, "item_changed", func(_ *Context, notification itemChangedNotification) error {
+		notifications <- notification
+		return nil
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	select {
+	case notification := <-notifications:
+		if notification.ID != "hello" || notification.Name != "from on connect" {
+			t.Fatalf("notification = %+v", notification)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client did not receive on-connect notification")
 	}
 }
 

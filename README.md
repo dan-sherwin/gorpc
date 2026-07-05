@@ -17,10 +17,11 @@ This is meant to keep the useful shape of `net/rpc` without inheriting gob as th
 - Length-prefixed MessagePack frames
 - Shared Go request/response structs
 - Synchronous and asynchronous unary request/response calls from either side
-- Request IDs in every request/response frame
+- One-way notifications/push messages from either side
+- Request IDs in every request/response/notification frame
 - Context deadline propagation and best-effort cancel frames
 - Client-side correlation IDs for asynchronous callbacks
-- Request-scoped `*gorpc.Context` with client name, request ID, function, and connection addresses
+- Message-scoped `*gorpc.Context` with client name, request/notification ID, function, and connection addresses
 - Structured remote errors
 - Max frame size enforcement
 - Basic protocol/version/codec handshake with optional client name metadata
@@ -30,9 +31,9 @@ This is meant to keep the useful shape of `net/rpc` without inheriting gob as th
 
 `Server.ServeTCP`, `Server.ServeUnix`, and `Server.ServeUnixPacket` cover the common listener cases. `Server.ServeListener` accepts any existing `net.Listener`.
 
-The words server and client only describe who accepts the connection and who initiates it. Once connected, both sides can register functions, send requests, receive responses, and handle incoming requests over the same full-duplex connection.
+The words server and client only describe who accepts the connection and who initiates it. Once connected, both sides can register functions, send requests, receive responses, send one-way notifications, and handle incoming messages over the same full-duplex connection.
 
-`TCPDial`, `UnixDial`, and `UnixPacketDial` establish the first connection, then the returned client keeps monitoring and reconnecting until `Close` is called. Reconnect attempts are intentionally aggressive: quick retry, exponential backoff capped at seconds, jitter, explicit dial timeouts, write deadlines, and ping/pong stale-connection detection. The lower-level `Dial` accepts a context, network, address, and full `ClientOptions` when you need explicit startup control. Use `NewTCPClient`, `NewUnixClient`, or `NewUnixPacketClient` when the dialing side needs to register functions before connecting. `Client.Call`, `Client.CallWithTimeout`, and `Client.CallContext` cover synchronous calls. `Client.AsyncCall` sends the request and invokes a typed callback when the response arrives. Calls made while disconnected wait for the next connection; timeout/context variants bound that wait. Calls already in flight when a connection drops fail with `ErrUnavailable`; GoRPC does not silently replay them because the remote side may already have processed the request.
+`TCPDial`, `UnixDial`, and `UnixPacketDial` establish the first connection, then the returned client keeps monitoring and reconnecting until `Close` is called. Reconnect attempts are intentionally aggressive: quick retry, exponential backoff capped at seconds, jitter, explicit dial timeouts, write deadlines, and ping/pong stale-connection detection. The lower-level `Dial` accepts a context, network, address, and full `ClientOptions` when you need explicit startup control. Use `NewTCPClient`, `NewUnixClient`, or `NewUnixPacketClient` when the dialing side needs to register functions before connecting. `Client.Call`, `Client.CallWithTimeout`, and `Client.CallContext` cover synchronous calls. `Client.AsyncCall` sends the request and invokes a typed callback when the response arrives. `Client.Notify` sends a one-way message and returns after the frame is written locally. Calls made while disconnected wait for the next connection; timeout/context variants bound that wait. Calls already in flight when a connection drops fail with `ErrUnavailable`; GoRPC does not silently replay them because the remote side may already have processed the request.
 
 Streaming, service discovery, pub/sub, load balancing, and generated code are intentionally out of v1.
 
@@ -68,7 +69,6 @@ package main
 
 import (
 	"log"
-	"time"
 
 	"github.com/dan-sherwin/gorpc"
 )
@@ -82,12 +82,8 @@ type GetItemResponse struct {
 	Name string
 }
 
-type ClientNoteRequest struct {
+type ClientNote struct {
 	ItemID string
-}
-
-type ClientNoteResponse struct {
-	Note string
 }
 
 func getItem(ctx *gorpc.Context, req GetItemRequest) (GetItemResponse, error) {
@@ -98,9 +94,8 @@ func getItem(ctx *gorpc.Context, req GetItemRequest) (GetItemResponse, error) {
 		ctx.RemoteAddr(),
 	)
 
-	var note ClientNoteResponse
-	if err := ctx.CallWithTimeout("client_note", ClientNoteRequest{ItemID: req.ID}, &note, time.Second); err == nil {
-		log.Printf("client note: %s", note.Note)
+	if err := ctx.Notify("client_note", ClientNote{ItemID: req.ID}); err != nil {
+		log.Printf("client notification failed: %v", err)
 	}
 
 	return GetItemResponse{
@@ -144,17 +139,13 @@ type GetItemResponse struct {
 	Name string
 }
 
-type ClientNoteRequest struct {
+type ClientNote struct {
 	ItemID string
-}
-
-type ClientNoteResponse struct {
-	Note string
 }
 
 func main() {
 	client := gorpc.NewTCPClient("127.0.0.1:9070", "inventory-example-client")
-	gorpc.MustRegister(client, "client_note", clientNote)
+	gorpc.MustRegisterNotify(client, "client_note", clientNote)
 
 	if err := client.Connect(context.Background()); err != nil {
 		log.Fatal(err)
@@ -171,8 +162,9 @@ func main() {
 	fmt.Printf("%s: %s\n", item.ID, item.Name)
 }
 
-func clientNote(_ *gorpc.Context, req ClientNoteRequest) (ClientNoteResponse, error) {
-	return ClientNoteResponse{Note: "client saw request for " + req.ItemID}, nil
+func clientNote(_ *gorpc.Context, note ClientNote) error {
+	fmt.Println("server push: client saw request for", note.ItemID)
+	return nil
 }
 ```
 
@@ -188,6 +180,23 @@ func handleGetItem(ctx gorpc.ClientContext, resp *GetItemResponse) {
 }
 
 if err := client.AsyncCall("get_an_item", GetItemRequest{ID: "widget-async"}, handleGetItem, "example-async-1"); err != nil {
+	log.Fatal(err)
+}
+```
+
+One-way notifications use `RegisterNotify` and `Notify`. A notify sender only learns whether the frame was written locally; it does not receive a remote success/error response.
+
+```go
+type ItemChanged struct {
+	ID string
+}
+
+gorpc.MustRegisterNotify(server, "item_changed", func(ctx *gorpc.Context, msg ItemChanged) error {
+	log.Println("item changed", msg.ID)
+	return nil
+})
+
+if err := client.Notify("item_changed", ItemChanged{ID: "widget-001"}); err != nil {
 	log.Fatal(err)
 }
 ```

@@ -73,6 +73,9 @@ type Client struct {
 	handlerMu sync.RWMutex
 	handlers  map[string]handler
 
+	notifyHandlerMu sync.RWMutex
+	notifyHandlers  map[string]notifyHandler
+
 	connMu sync.Mutex
 	conn   net.Conn
 	ready  chan struct{}
@@ -179,6 +182,7 @@ func NewClient(network, address string, opts ClientOptions) *Client {
 		ready:             make(chan struct{}),
 		reconnectCh:       make(chan struct{}, 1),
 		handlers:          make(map[string]handler),
+		notifyHandlers:    make(map[string]notifyHandler),
 		pending:           make(map[uint64]pendingCall),
 		requests:          make(map[uint64]context.CancelFunc),
 		closed:            make(chan struct{}),
@@ -338,6 +342,32 @@ func (c *Client) AsyncCallContext(ctx context.Context, function string, req any,
 	return err
 }
 
+// Notify sends a one-way typed notification using context.Background.
+func (c *Client) Notify(function string, req any) error {
+	return c.NotifyContext(context.Background(), function, req)
+}
+
+// NotifyWithTimeout sends a one-way typed notification with a timeout while
+// waiting for a connection and writing the notification frame.
+func (c *Client) NotifyWithTimeout(function string, req any, timeout time.Duration) error {
+	if timeout <= 0 {
+		return c.Notify(function, req)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	return c.NotifyContext(ctx, function, req)
+}
+
+// NotifyContext sends a one-way typed notification. Success means the frame was
+// written locally; GoRPC does not wait for remote handler completion or remote
+// errors.
+func (c *Client) NotifyContext(ctx context.Context, function string, req any) error {
+	_, err := c.sendNotify(ctx, function, req)
+	return err
+}
+
 // Call performs a typed unary request/response call.
 func Call[Req, Resp any](ctx context.Context, client *Client, function string, req Req) (Resp, error) {
 	var resp Resp
@@ -356,6 +386,26 @@ type ClientFunc[Req, Resp any] func(context.Context, Req) (Resp, error)
 func Function[Req, Resp any](client *Client, function string) ClientFunc[Req, Resp] {
 	return func(ctx context.Context, req Req) (Resp, error) {
 		return Call[Req, Resp](ctx, client, function, req)
+	}
+}
+
+// Notify sends a typed one-way notification.
+func Notify[Req any](ctx context.Context, client *Client, function string, req Req) error {
+	if client == nil {
+		return ErrClosed
+	}
+
+	return client.NotifyContext(ctx, function, req)
+}
+
+// NotifyFunc is the typed function shape returned by Notification.
+type NotifyFunc[Req any] func(context.Context, Req) error
+
+// Notification returns a typed client notification function bound to a remote
+// function name.
+func Notification[Req any](client *Client, function string) NotifyFunc[Req] {
+	return func(ctx context.Context, req Req) error {
+		return Notify(ctx, client, function, req)
 	}
 }
 
@@ -395,6 +445,44 @@ func (c *Client) sendRequest(ctx context.Context, function string, req any, pend
 
 	if err := c.writeTo(conn, frame); err != nil {
 		c.removePending(requestID)
+		c.connectionLost(conn, err)
+		return 0, err
+	}
+
+	return requestID, nil
+}
+
+func (c *Client) sendNotify(ctx context.Context, function string, req any) (uint64, error) {
+	ctx = normalizeContext(ctx)
+	if c == nil {
+		return 0, ErrClosed
+	}
+	if function == "" {
+		return 0, ErrInvalidFunction
+	}
+
+	payload, err := c.codec.Marshal(req)
+	if err != nil {
+		return 0, fmt.Errorf("encode notification: %w", err)
+	}
+
+	conn, err := c.waitConn(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	requestID := c.nextID.Add(1)
+	frame := Frame{
+		Type:      FrameNotify,
+		RequestID: requestID,
+		Function:  function,
+		Payload:   payload,
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		frame.DeadlineUnixNano = deadline.UnixNano()
+	}
+
+	if err := c.writeTo(conn, frame); err != nil {
 		c.connectionLost(conn, err)
 		return 0, err
 	}
@@ -497,6 +585,28 @@ func (c *Client) registerHandler(function string, h handler) error {
 	return nil
 }
 
+func (c *Client) registerNotifyHandler(function string, h notifyHandler) error {
+	if c == nil {
+		return ErrClosed
+	}
+	if function == "" || h == nil {
+		return ErrInvalidFunction
+	}
+
+	c.notifyHandlerMu.Lock()
+	defer c.notifyHandlerMu.Unlock()
+
+	if c.notifyHandlers == nil {
+		c.notifyHandlers = make(map[string]notifyHandler)
+	}
+	if _, exists := c.notifyHandlers[function]; exists {
+		return ErrDuplicateFunction
+	}
+	c.notifyHandlers[function] = h
+
+	return nil
+}
+
 func (c *Client) handlerCodec() Codec {
 	if c == nil {
 		return nil
@@ -510,6 +620,13 @@ func (c *Client) findHandler(function string) handler {
 	defer c.handlerMu.RUnlock()
 
 	return c.handlers[function]
+}
+
+func (c *Client) findNotifyHandler(function string) notifyHandler {
+	c.notifyHandlerMu.RLock()
+	defer c.notifyHandlerMu.RUnlock()
+
+	return c.notifyHandlers[function]
 }
 
 func normalizeContext(ctx context.Context) context.Context {
@@ -835,6 +952,8 @@ func (c *Client) readLoop(conn net.Conn) {
 		switch frame.Type {
 		case FrameRequest:
 			c.startRequest(conn, frame)
+		case FrameNotify:
+			c.startNotify(conn, frame)
 		case FrameResponse, FrameError:
 			if !c.complete(frame.RequestID, clientResponse{frame: frame}) {
 				c.logDebug("gorpc discarded response for unknown request", "request_id", frame.RequestID)
@@ -925,6 +1044,61 @@ func (c *Client) startRequest(conn net.Conn, frame Frame) {
 			Function:  frame.Function,
 			Payload:   payload,
 		})
+	}()
+}
+
+func (c *Client) startNotify(conn net.Conn, frame Frame) {
+	if frame.RequestID == 0 {
+		c.logDebug("gorpc discarded notification without request_id", "function", frame.Function)
+		return
+	}
+	if frame.Function == "" {
+		c.logDebug("gorpc discarded notification without function", "request_id", frame.RequestID)
+		return
+	}
+
+	h := c.findNotifyHandler(frame.Function)
+	if h == nil {
+		c.logDebug("gorpc discarded notification for unregistered function", "function", frame.Function, "request_id", frame.RequestID)
+		return
+	}
+
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if frame.DeadlineUnixNano > 0 {
+		deadline := time.Unix(0, frame.DeadlineUnixNano)
+		ctx, cancel = context.WithDeadline(context.Background(), deadline)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
+
+	rpcCtx := &Context{
+		Context:    ctx,
+		requestID:  frame.RequestID,
+		function:   frame.Function,
+		remoteAddr: conn.RemoteAddr(),
+		localAddr:  conn.LocalAddr(),
+		notify:     true,
+	}
+
+	c.requestMu.Lock()
+	c.requests[frame.RequestID] = cancel
+	c.requestMu.Unlock()
+
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				c.logDebug("gorpc notify handler panic", "function", frame.Function, "request_id", frame.RequestID, "panic", recovered)
+			}
+			cancel()
+			c.requestMu.Lock()
+			delete(c.requests, frame.RequestID)
+			c.requestMu.Unlock()
+		}()
+
+		if err := h(rpcCtx, frame.Payload); err != nil {
+			c.logDebug("gorpc notify handler failed", "function", frame.Function, "request_id", frame.RequestID, "error", err)
+		}
 	}()
 }
 
