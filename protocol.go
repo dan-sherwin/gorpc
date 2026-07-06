@@ -21,6 +21,7 @@ const (
 	FrameAuth
 	FrameAuthAck
 	FrameNotify
+	FrameStreamStart
 )
 
 func (t FrameType) String() string {
@@ -51,6 +52,33 @@ func (t FrameType) String() string {
 		return "auth_ack"
 	case FrameNotify:
 		return "notify"
+	case FrameStreamStart:
+		return "stream_start"
+	default:
+		return "unknown"
+	}
+}
+
+// StreamKind identifies the shape of a streaming function.
+type StreamKind uint8
+
+const (
+	// StreamKindServer means the caller sends one request and the handler sends zero or more items.
+	StreamKindServer StreamKind = iota + 1
+	// StreamKindClient means the caller sends zero or more items and the handler sends one response.
+	StreamKindClient
+	// StreamKindBidi means both sides can send and receive stream items.
+	StreamKindBidi
+)
+
+func (k StreamKind) String() string {
+	switch k {
+	case StreamKindServer:
+		return "server"
+	case StreamKindClient:
+		return "client"
+	case StreamKindBidi:
+		return "bidi"
 	default:
 		return "unknown"
 	}
@@ -59,12 +87,13 @@ func (t FrameType) String() string {
 // Frame is the v1 wire envelope. It is MessagePack-encoded and written with a
 // 4-byte big-endian length prefix.
 type Frame struct {
-	Version          uint16    `msgpack:"version"`
-	Type             FrameType `msgpack:"type"`
-	RequestID        uint64    `msgpack:"request_id,omitempty"`
-	Function         string    `msgpack:"function,omitempty"`
-	DeadlineUnixNano int64     `msgpack:"deadline_unix_nano,omitempty"`
-	Payload          []byte    `msgpack:"payload,omitempty"`
+	Version          uint16     `msgpack:"version"`
+	Type             FrameType  `msgpack:"type"`
+	RequestID        uint64     `msgpack:"request_id,omitempty"`
+	Function         string     `msgpack:"function,omitempty"`
+	StreamKind       StreamKind `msgpack:"stream_kind,omitempty"`
+	DeadlineUnixNano int64      `msgpack:"deadline_unix_nano,omitempty"`
+	Payload          []byte     `msgpack:"payload,omitempty"`
 }
 
 type hello struct {

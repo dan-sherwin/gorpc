@@ -35,6 +35,18 @@ type HandlerFunc[Req, Resp any] func(*Context, Req) (Resp, error)
 // notification handlers.
 type NotifyHandlerFunc[Req any] func(*Context, Req) error
 
+// ServerStreamHandlerFunc handles one request and sends zero or more response
+// items before returning.
+type ServerStreamHandlerFunc[Req, Item any] func(*Context, Req, *StreamWriter[Item]) error
+
+// ClientStreamHandlerFunc receives zero or more request items and returns one
+// final response.
+type ClientStreamHandlerFunc[Item, Resp any] func(*Context, *StreamReader[Item]) (Resp, error)
+
+// BidiStreamHandlerFunc receives and sends stream items until either side
+// closes its sending direction.
+type BidiStreamHandlerFunc[Recv, Send any] func(*Context, *BidiStreamHandle[Send, Recv]) error
+
 // Server accepts GoRPC connections, dispatches registered functions, and exposes
 // accepted connections that can initiate requests back to the dialing side.
 type Server struct {
@@ -53,6 +65,15 @@ type Server struct {
 	notifyHandlerMu sync.RWMutex
 	notifyHandlers  map[string]notifyHandler
 
+	serverStreamHandlerMu sync.RWMutex
+	serverStreamHandlers  map[string]serverStreamHandler
+
+	clientStreamHandlerMu sync.RWMutex
+	clientStreamHandlers  map[string]clientStreamHandler
+
+	bidiStreamHandlerMu sync.RWMutex
+	bidiStreamHandlers  map[string]bidiStreamHandler
+
 	listenerMu sync.Mutex
 	listener   net.Listener
 
@@ -65,6 +86,9 @@ type Server struct {
 
 type handler func(*Context, []byte) ([]byte, error)
 type notifyHandler func(*Context, []byte) error
+type serverStreamHandler func(*Context, []byte, *Stream) error
+type clientStreamHandler func(*Context, *Stream) ([]byte, error)
+type bidiStreamHandler func(*Context, *Stream) error
 
 type handlerRegistrar interface {
 	handlerCodec() Codec
@@ -76,20 +100,30 @@ type notifyHandlerRegistrar interface {
 	registerNotifyHandler(function string, h notifyHandler) error
 }
 
+type streamHandlerRegistrar interface {
+	handlerCodec() Codec
+	registerServerStreamHandler(function string, h serverStreamHandler) error
+	registerClientStreamHandler(function string, h clientStreamHandler) error
+	registerBidiStreamHandler(function string, h bidiStreamHandler) error
+}
+
 // NewServer creates a Server with default codec and limits where options are unset.
 func NewServer(opts ServerOptions) *Server {
 	return &Server{
-		codec:            defaultCodec(opts.Codec),
-		maxFrameSize:     normalizeMaxFrameSize(opts.MaxFrameSize),
-		handshakeTimeout: normalizeHandshakeTimeout(opts.HandshakeTimeout),
-		auth:             opts.Auth,
-		writeTimeout:     normalizeWriteTimeout(opts.WriteTimeout),
-		logger:           opts.Logger,
-		onConnect:        opts.OnConnect,
-		onDisconnect:     opts.OnDisconnect,
-		handlers:         make(map[string]handler),
-		notifyHandlers:   make(map[string]notifyHandler),
-		conns:            make(map[*Conn]struct{}),
+		codec:                defaultCodec(opts.Codec),
+		maxFrameSize:         normalizeMaxFrameSize(opts.MaxFrameSize),
+		handshakeTimeout:     normalizeHandshakeTimeout(opts.HandshakeTimeout),
+		auth:                 opts.Auth,
+		writeTimeout:         normalizeWriteTimeout(opts.WriteTimeout),
+		logger:               opts.Logger,
+		onConnect:            opts.OnConnect,
+		onDisconnect:         opts.OnDisconnect,
+		handlers:             make(map[string]handler),
+		notifyHandlers:       make(map[string]notifyHandler),
+		serverStreamHandlers: make(map[string]serverStreamHandler),
+		clientStreamHandlers: make(map[string]clientStreamHandler),
+		bidiStreamHandlers:   make(map[string]bidiStreamHandler),
+		conns:                make(map[*Conn]struct{}),
 	}
 }
 
@@ -141,6 +175,75 @@ func RegisterNotify[Req any](target any, function string, fn NotifyHandlerFunc[R
 	return registrar.registerNotifyHandler(function, wrapNotifyHandler(codec, fn))
 }
 
+// RegisterServerStream binds a typed server-streaming handler to a function
+// name. The caller sends one request and receives zero or more response items.
+func RegisterServerStream[Req, Item any](target any, function string, fn ServerStreamHandlerFunc[Req, Item]) error {
+	if target == nil {
+		return ErrClosed
+	}
+	if function == "" || fn == nil {
+		return ErrInvalidFunction
+	}
+
+	registrar, ok := target.(streamHandlerRegistrar)
+	if !ok {
+		return ErrInvalidHandler
+	}
+
+	codec := registrar.handlerCodec()
+	if codec == nil {
+		return ErrClosed
+	}
+
+	return registrar.registerServerStreamHandler(function, wrapServerStreamHandler(codec, fn))
+}
+
+// RegisterClientStream binds a typed client-streaming handler to a function
+// name. The caller sends zero or more request items and receives one response.
+func RegisterClientStream[Item, Resp any](target any, function string, fn ClientStreamHandlerFunc[Item, Resp]) error {
+	if target == nil {
+		return ErrClosed
+	}
+	if function == "" || fn == nil {
+		return ErrInvalidFunction
+	}
+
+	registrar, ok := target.(streamHandlerRegistrar)
+	if !ok {
+		return ErrInvalidHandler
+	}
+
+	codec := registrar.handlerCodec()
+	if codec == nil {
+		return ErrClosed
+	}
+
+	return registrar.registerClientStreamHandler(function, wrapClientStreamHandler(codec, fn))
+}
+
+// RegisterBidiStream binds a typed bidirectional-streaming handler to a
+// function name. Both sides can send and receive stream items.
+func RegisterBidiStream[Recv, Send any](target any, function string, fn BidiStreamHandlerFunc[Recv, Send]) error {
+	if target == nil {
+		return ErrClosed
+	}
+	if function == "" || fn == nil {
+		return ErrInvalidFunction
+	}
+
+	registrar, ok := target.(streamHandlerRegistrar)
+	if !ok {
+		return ErrInvalidHandler
+	}
+
+	codec := registrar.handlerCodec()
+	if codec == nil {
+		return ErrClosed
+	}
+
+	return registrar.registerBidiStreamHandler(function, wrapBidiStreamHandler(codec, fn))
+}
+
 func wrapHandler[Req, Resp any](codec Codec, fn HandlerFunc[Req, Resp]) handler {
 	wrapped := func(ctx *Context, payload []byte) ([]byte, error) {
 		var req Req
@@ -159,6 +262,45 @@ func wrapHandler[Req, Resp any](codec Codec, fn HandlerFunc[Req, Resp]) handler 
 		}
 
 		return data, nil
+	}
+
+	return wrapped
+}
+
+func wrapServerStreamHandler[Req, Item any](codec Codec, fn ServerStreamHandlerFunc[Req, Item]) serverStreamHandler {
+	wrapped := func(ctx *Context, payload []byte, stream *Stream) error {
+		var req Req
+		if err := codec.Unmarshal(payload, &req); err != nil {
+			return NewRemoteError(ErrorCodeInvalidRequest, fmt.Sprintf("decode stream request: %v", err), nil)
+		}
+
+		return fn(ctx, req, &StreamWriter[Item]{stream: stream})
+	}
+
+	return wrapped
+}
+
+func wrapClientStreamHandler[Item, Resp any](codec Codec, fn ClientStreamHandlerFunc[Item, Resp]) clientStreamHandler {
+	wrapped := func(ctx *Context, stream *Stream) ([]byte, error) {
+		resp, err := fn(ctx, &StreamReader[Item]{stream: stream})
+		if err != nil {
+			return nil, err
+		}
+
+		data, err := codec.Marshal(resp)
+		if err != nil {
+			return nil, fmt.Errorf("encode stream response: %w", err)
+		}
+
+		return data, nil
+	}
+
+	return wrapped
+}
+
+func wrapBidiStreamHandler[Recv, Send any](_ Codec, fn BidiStreamHandlerFunc[Recv, Send]) bidiStreamHandler {
+	wrapped := func(ctx *Context, stream *Stream) error {
+		return fn(ctx, &BidiStreamHandle[Send, Recv]{stream: stream})
 	}
 
 	return wrapped
@@ -221,6 +363,72 @@ func (s *Server) registerNotifyHandler(function string, h notifyHandler) error {
 	return nil
 }
 
+func (s *Server) registerServerStreamHandler(function string, h serverStreamHandler) error {
+	if s == nil {
+		return ErrClosed
+	}
+	if function == "" || h == nil {
+		return ErrInvalidFunction
+	}
+
+	s.serverStreamHandlerMu.Lock()
+	defer s.serverStreamHandlerMu.Unlock()
+
+	if s.serverStreamHandlers == nil {
+		s.serverStreamHandlers = make(map[string]serverStreamHandler)
+	}
+	if _, exists := s.serverStreamHandlers[function]; exists {
+		return ErrDuplicateFunction
+	}
+	s.serverStreamHandlers[function] = h
+
+	return nil
+}
+
+func (s *Server) registerClientStreamHandler(function string, h clientStreamHandler) error {
+	if s == nil {
+		return ErrClosed
+	}
+	if function == "" || h == nil {
+		return ErrInvalidFunction
+	}
+
+	s.clientStreamHandlerMu.Lock()
+	defer s.clientStreamHandlerMu.Unlock()
+
+	if s.clientStreamHandlers == nil {
+		s.clientStreamHandlers = make(map[string]clientStreamHandler)
+	}
+	if _, exists := s.clientStreamHandlers[function]; exists {
+		return ErrDuplicateFunction
+	}
+	s.clientStreamHandlers[function] = h
+
+	return nil
+}
+
+func (s *Server) registerBidiStreamHandler(function string, h bidiStreamHandler) error {
+	if s == nil {
+		return ErrClosed
+	}
+	if function == "" || h == nil {
+		return ErrInvalidFunction
+	}
+
+	s.bidiStreamHandlerMu.Lock()
+	defer s.bidiStreamHandlerMu.Unlock()
+
+	if s.bidiStreamHandlers == nil {
+		s.bidiStreamHandlers = make(map[string]bidiStreamHandler)
+	}
+	if _, exists := s.bidiStreamHandlers[function]; exists {
+		return ErrDuplicateFunction
+	}
+	s.bidiStreamHandlers[function] = h
+
+	return nil
+}
+
 func (s *Server) handlerCodec() Codec {
 	if s == nil {
 		return nil
@@ -239,6 +447,27 @@ func MustRegister[Req, Resp any](target any, function string, fn HandlerFunc[Req
 // MustRegisterNotify is RegisterNotify that panics on error.
 func MustRegisterNotify[Req any](target any, function string, fn NotifyHandlerFunc[Req]) {
 	if err := RegisterNotify(target, function, fn); err != nil {
+		panic(err)
+	}
+}
+
+// MustRegisterServerStream is RegisterServerStream that panics on error.
+func MustRegisterServerStream[Req, Item any](target any, function string, fn ServerStreamHandlerFunc[Req, Item]) {
+	if err := RegisterServerStream(target, function, fn); err != nil {
+		panic(err)
+	}
+}
+
+// MustRegisterClientStream is RegisterClientStream that panics on error.
+func MustRegisterClientStream[Item, Resp any](target any, function string, fn ClientStreamHandlerFunc[Item, Resp]) {
+	if err := RegisterClientStream(target, function, fn); err != nil {
+		panic(err)
+	}
+}
+
+// MustRegisterBidiStream is RegisterBidiStream that panics on error.
+func MustRegisterBidiStream[Recv, Send any](target any, function string, fn BidiStreamHandlerFunc[Recv, Send]) {
+	if err := RegisterBidiStream(target, function, fn); err != nil {
 		panic(err)
 	}
 }
@@ -366,9 +595,19 @@ func (s *Server) serveConn(conn net.Conn) {
 			sc.startRequest(frame)
 		case FrameNotify:
 			sc.startNotify(frame)
-		case FrameResponse, FrameError:
+		case FrameStreamStart:
+			sc.startStream(frame)
+		case FrameStreamItem, FrameStreamEnd:
+			if !sc.deliverStreamFrame(frame) {
+				s.logDebug("gorpc discarded stream frame for unknown request", "type", frame.Type.String(), "request_id", frame.RequestID)
+			}
+		case FrameResponse:
 			if !sc.complete(frame.RequestID, clientResponse{frame: frame}) {
 				s.logDebug("gorpc discarded response for unknown request", "request_id", frame.RequestID)
+			}
+		case FrameError:
+			if !sc.complete(frame.RequestID, clientResponse{frame: frame}) && !sc.deliverStreamFrame(frame) {
+				s.logDebug("gorpc discarded error for unknown request", "request_id", frame.RequestID)
 			}
 		case FrameCancel:
 			sc.cancel(frame.RequestID)
@@ -516,6 +755,27 @@ func (s *Server) findNotifyHandler(function string) notifyHandler {
 	return s.notifyHandlers[function]
 }
 
+func (s *Server) findServerStreamHandler(function string) serverStreamHandler {
+	s.serverStreamHandlerMu.RLock()
+	defer s.serverStreamHandlerMu.RUnlock()
+
+	return s.serverStreamHandlers[function]
+}
+
+func (s *Server) findClientStreamHandler(function string) clientStreamHandler {
+	s.clientStreamHandlerMu.RLock()
+	defer s.clientStreamHandlerMu.RUnlock()
+
+	return s.clientStreamHandlers[function]
+}
+
+func (s *Server) findBidiStreamHandler(function string) bidiStreamHandler {
+	s.bidiStreamHandlerMu.RLock()
+	defer s.bidiStreamHandlerMu.RUnlock()
+
+	return s.bidiStreamHandlers[function]
+}
+
 func (s *Server) setListener(ln net.Listener) bool {
 	s.listenerMu.Lock()
 	defer s.listenerMu.Unlock()
@@ -617,6 +877,9 @@ type Conn struct {
 	requestMu sync.Mutex
 	requests  map[uint64]context.CancelFunc
 
+	streamMu sync.Mutex
+	streams  map[uint64]*Stream
+
 	closeOnce  sync.Once
 	closed     chan struct{}
 	closeErrMu sync.Mutex
@@ -629,6 +892,7 @@ func newConn(server *Server, conn net.Conn) *Conn {
 		conn:     conn,
 		pending:  make(map[uint64]pendingCall),
 		requests: make(map[uint64]context.CancelFunc),
+		streams:  make(map[uint64]*Stream),
 		closed:   make(chan struct{}),
 	}
 }
@@ -788,7 +1052,7 @@ func (c *Conn) sendRequest(ctx context.Context, function string, req any, pendin
 		return 0, fmt.Errorf("encode request: %w", err)
 	}
 
-	requestID := c.nextID.Add(1)
+	requestID := c.nextRequestID()
 	if err := c.addPending(requestID, pending); err != nil {
 		return 0, err
 	}
@@ -826,7 +1090,7 @@ func (c *Conn) sendNotify(ctx context.Context, function string, req any) (uint64
 		return 0, fmt.Errorf("encode notification: %w", err)
 	}
 
-	requestID := c.nextID.Add(1)
+	requestID := c.nextRequestID()
 	frame := Frame{
 		Type:      FrameNotify,
 		RequestID: requestID,
@@ -843,6 +1107,136 @@ func (c *Conn) sendNotify(ctx context.Context, function string, req any) (uint64
 	}
 
 	return requestID, nil
+}
+
+func (c *Conn) openServerStream(ctx context.Context, function string, req any) (*Stream, error) {
+	ctx = normalizeContext(ctx)
+	if c == nil || c.server == nil {
+		return nil, ErrClosed
+	}
+	if function == "" {
+		return nil, ErrInvalidFunction
+	}
+
+	payload, err := c.server.codec.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode stream request: %w", err)
+	}
+
+	requestID := c.nextRequestID()
+	stream := newStream(ctx, requestID, function, c.server.codec, func(frame Frame) error {
+		if err := c.write(frame); err != nil {
+			c.closeWithError(err)
+			return err
+		}
+		return nil
+	}, c.removeStream)
+	if err := c.addStream(stream); err != nil {
+		return nil, err
+	}
+
+	frame := Frame{
+		Type:       FrameStreamStart,
+		StreamKind: StreamKindServer,
+		RequestID:  requestID,
+		Function:   function,
+		Payload:    payload,
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		frame.DeadlineUnixNano = deadline.UnixNano()
+	}
+
+	if err := c.write(frame); err != nil {
+		c.removeStream(requestID)
+		stream.deliverError(fmt.Errorf("%w: %v", ErrUnavailable, err))
+		c.closeWithError(err)
+		return nil, err
+	}
+
+	return stream, nil
+}
+
+func (c *Conn) openClientStream(ctx context.Context, function string) (*Stream, chan clientResponse, func(uint64), Codec, error) {
+	ctx = normalizeContext(ctx)
+	if c == nil || c.server == nil {
+		return nil, nil, nil, nil, ErrClosed
+	}
+	if function == "" {
+		return nil, nil, nil, nil, ErrInvalidFunction
+	}
+
+	requestID := c.nextRequestID()
+	responseCh := make(chan clientResponse, 1)
+	if err := c.addPending(requestID, syncPendingCall{ch: responseCh}); err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	stream := newStream(ctx, requestID, function, c.server.codec, func(frame Frame) error {
+		if err := c.write(frame); err != nil {
+			c.closeWithError(err)
+			return err
+		}
+		return nil
+	}, nil)
+	frame := Frame{
+		Type:       FrameStreamStart,
+		StreamKind: StreamKindClient,
+		RequestID:  requestID,
+		Function:   function,
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		frame.DeadlineUnixNano = deadline.UnixNano()
+	}
+
+	if err := c.write(frame); err != nil {
+		c.removePending(requestID)
+		stream.finish(fmt.Errorf("%w: %v", ErrUnavailable, err))
+		c.closeWithError(err)
+		return nil, nil, nil, nil, err
+	}
+
+	return stream, responseCh, c.removePending, c.server.codec, nil
+}
+
+func (c *Conn) openBidiStream(ctx context.Context, function string) (*Stream, error) {
+	ctx = normalizeContext(ctx)
+	if c == nil || c.server == nil {
+		return nil, ErrClosed
+	}
+	if function == "" {
+		return nil, ErrInvalidFunction
+	}
+
+	requestID := c.nextRequestID()
+	stream := newStream(ctx, requestID, function, c.server.codec, func(frame Frame) error {
+		if err := c.write(frame); err != nil {
+			c.closeWithError(err)
+			return err
+		}
+		return nil
+	}, c.removeStream)
+	if err := c.addStream(stream); err != nil {
+		return nil, err
+	}
+
+	frame := Frame{
+		Type:       FrameStreamStart,
+		StreamKind: StreamKindBidi,
+		RequestID:  requestID,
+		Function:   function,
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		frame.DeadlineUnixNano = deadline.UnixNano()
+	}
+
+	if err := c.write(frame); err != nil {
+		c.removeStream(requestID)
+		stream.deliverError(fmt.Errorf("%w: %v", ErrUnavailable, err))
+		c.closeWithError(err)
+		return nil, err
+	}
+
+	return stream, nil
 }
 
 func (c *Conn) startRequest(frame Frame) {
@@ -979,6 +1373,229 @@ func (c *Conn) startNotify(frame Frame) {
 	}()
 }
 
+func (c *Conn) startStream(frame Frame) {
+	if frame.RequestID == 0 {
+		_ = c.writeError(frame, RemoteError{
+			Code:    ErrorCodeInvalidRequest,
+			Message: "request_id is required",
+		})
+		return
+	}
+	if frame.Function == "" {
+		_ = c.writeError(frame, RemoteError{
+			Code:    ErrorCodeInvalidRequest,
+			Message: "function is required",
+		})
+		return
+	}
+
+	switch frame.StreamKind {
+	case StreamKindServer:
+		c.startServerStream(frame)
+	case StreamKindClient:
+		c.startClientStream(frame)
+	case StreamKindBidi:
+		c.startBidiStream(frame)
+	default:
+		_ = c.writeError(frame, RemoteError{
+			Code:    ErrorCodeInvalidRequest,
+			Message: fmt.Sprintf("unsupported stream kind %q", frame.StreamKind.String()),
+		})
+	}
+}
+
+func (c *Conn) startServerStream(frame Frame) {
+	h := c.server.findServerStreamHandler(frame.Function)
+	if h == nil {
+		_ = c.writeError(frame, RemoteError{
+			Code:    ErrorCodeNotFound,
+			Message: fmt.Sprintf("stream function %q is not registered", frame.Function),
+		})
+		return
+	}
+
+	ctx, cancel := contextFromFrame(frame)
+	rpcCtx := &Context{
+		Context:    ctx,
+		clientName: c.clientName,
+		requestID:  frame.RequestID,
+		function:   frame.Function,
+		remoteAddr: c.conn.RemoteAddr(),
+		localAddr:  c.conn.LocalAddr(),
+		conn:       c,
+		stream:     true,
+		streamKind: StreamKindServer,
+	}
+	stream := newStream(ctx, frame.RequestID, frame.Function, c.server.codec, func(writeFrame Frame) error {
+		if err := c.write(writeFrame); err != nil {
+			c.closeWithError(err)
+			return err
+		}
+		return nil
+	}, nil)
+
+	c.requestMu.Lock()
+	c.requests[frame.RequestID] = cancel
+	c.requestMu.Unlock()
+
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				_ = c.writeError(frame, RemoteError{
+					Code:    ErrorCodeInternal,
+					Message: fmt.Sprintf("stream handler panic: %v", recovered),
+				})
+			}
+			cancel()
+			c.requestMu.Lock()
+			delete(c.requests, frame.RequestID)
+			c.requestMu.Unlock()
+		}()
+
+		if err := h(rpcCtx, frame.Payload, stream); err != nil {
+			_ = c.writeError(frame, remoteErrorFromError(err))
+			stream.finish(err)
+			return
+		}
+
+		_ = stream.CloseSend()
+	}()
+}
+
+func (c *Conn) startClientStream(frame Frame) {
+	h := c.server.findClientStreamHandler(frame.Function)
+	if h == nil {
+		_ = c.writeError(frame, RemoteError{
+			Code:    ErrorCodeNotFound,
+			Message: fmt.Sprintf("stream function %q is not registered", frame.Function),
+		})
+		return
+	}
+
+	ctx, cancel := contextFromFrame(frame)
+	rpcCtx := &Context{
+		Context:    ctx,
+		clientName: c.clientName,
+		requestID:  frame.RequestID,
+		function:   frame.Function,
+		remoteAddr: c.conn.RemoteAddr(),
+		localAddr:  c.conn.LocalAddr(),
+		conn:       c,
+		stream:     true,
+		streamKind: StreamKindClient,
+	}
+	stream := newStream(ctx, frame.RequestID, frame.Function, c.server.codec, func(writeFrame Frame) error {
+		if err := c.write(writeFrame); err != nil {
+			c.closeWithError(err)
+			return err
+		}
+		return nil
+	}, c.removeStream)
+	if err := c.addStream(stream); err != nil {
+		_ = c.writeError(frame, remoteErrorFromError(err))
+		cancel()
+		return
+	}
+
+	c.requestMu.Lock()
+	c.requests[frame.RequestID] = cancel
+	c.requestMu.Unlock()
+
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				_ = c.writeError(frame, RemoteError{
+					Code:    ErrorCodeInternal,
+					Message: fmt.Sprintf("stream handler panic: %v", recovered),
+				})
+			}
+			c.removeStream(frame.RequestID)
+			stream.finish(ErrClosed)
+			cancel()
+			c.requestMu.Lock()
+			delete(c.requests, frame.RequestID)
+			c.requestMu.Unlock()
+		}()
+
+		payload, err := h(rpcCtx, stream)
+		if err != nil {
+			_ = c.writeError(frame, remoteErrorFromError(err))
+			return
+		}
+
+		_ = c.write(Frame{
+			Type:      FrameResponse,
+			RequestID: frame.RequestID,
+			Function:  frame.Function,
+			Payload:   payload,
+		})
+	}()
+}
+
+func (c *Conn) startBidiStream(frame Frame) {
+	h := c.server.findBidiStreamHandler(frame.Function)
+	if h == nil {
+		_ = c.writeError(frame, RemoteError{
+			Code:    ErrorCodeNotFound,
+			Message: fmt.Sprintf("stream function %q is not registered", frame.Function),
+		})
+		return
+	}
+
+	ctx, cancel := contextFromFrame(frame)
+	rpcCtx := &Context{
+		Context:    ctx,
+		clientName: c.clientName,
+		requestID:  frame.RequestID,
+		function:   frame.Function,
+		remoteAddr: c.conn.RemoteAddr(),
+		localAddr:  c.conn.LocalAddr(),
+		conn:       c,
+		stream:     true,
+		streamKind: StreamKindBidi,
+	}
+	stream := newStream(ctx, frame.RequestID, frame.Function, c.server.codec, func(writeFrame Frame) error {
+		if err := c.write(writeFrame); err != nil {
+			c.closeWithError(err)
+			return err
+		}
+		return nil
+	}, c.removeStream)
+	if err := c.addStream(stream); err != nil {
+		_ = c.writeError(frame, remoteErrorFromError(err))
+		cancel()
+		return
+	}
+
+	c.requestMu.Lock()
+	c.requests[frame.RequestID] = cancel
+	c.requestMu.Unlock()
+
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				_ = c.writeError(frame, RemoteError{
+					Code:    ErrorCodeInternal,
+					Message: fmt.Sprintf("stream handler panic: %v", recovered),
+				})
+			}
+			c.removeStream(frame.RequestID)
+			stream.finish(ErrClosed)
+			cancel()
+			c.requestMu.Lock()
+			delete(c.requests, frame.RequestID)
+			c.requestMu.Unlock()
+		}()
+
+		if err := h(rpcCtx, stream); err != nil {
+			_ = c.writeError(frame, remoteErrorFromError(err))
+			return
+		}
+
+		_ = stream.CloseSend()
+	}()
+}
+
 func (c *Conn) cancel(requestID uint64) {
 	c.requestMu.Lock()
 	cancel := c.requests[requestID]
@@ -1029,6 +1646,10 @@ func (c *Conn) write(frame Frame) error {
 	}
 
 	return writeFrame(c.conn, c.server.maxFrameSize, c.server.codec, frame)
+}
+
+func (c *Conn) nextRequestID() uint64 {
+	return c.nextID.Add(2)
 }
 
 func (c *Conn) addPending(requestID uint64, pending pendingCall) error {
@@ -1091,6 +1712,81 @@ func (c *Conn) failPending(err error) {
 	}
 }
 
+func (c *Conn) addStream(stream *Stream) error {
+	if stream == nil {
+		return ErrClosed
+	}
+
+	select {
+	case <-c.closed:
+		return c.closedError()
+	default:
+	}
+
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+
+	select {
+	case <-c.closed:
+		return c.closedError()
+	default:
+		c.streams[stream.RequestID()] = stream
+		return nil
+	}
+}
+
+func (c *Conn) removeStream(requestID uint64) {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+
+	delete(c.streams, requestID)
+}
+
+func (c *Conn) findStream(requestID uint64) *Stream {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+
+	return c.streams[requestID]
+}
+
+func (c *Conn) deliverStreamFrame(frame Frame) bool {
+	stream := c.findStream(frame.RequestID)
+	if stream == nil {
+		return false
+	}
+
+	switch frame.Type {
+	case FrameStreamItem:
+		stream.deliverItem(frame)
+	case FrameStreamEnd:
+		stream.deliverEnd()
+	case FrameError:
+		stream.deliverError(remoteErrorFromFrame(c.server.codec, frame))
+	default:
+		return false
+	}
+
+	return true
+}
+
+func (c *Conn) failStreams(err error) {
+	if err == nil {
+		err = ErrUnavailable
+	}
+
+	c.streamMu.Lock()
+	streams := make([]*Stream, 0, len(c.streams))
+	for requestID, stream := range c.streams {
+		delete(c.streams, requestID)
+		streams = append(streams, stream)
+	}
+	c.streamMu.Unlock()
+
+	for _, stream := range streams {
+		stream.deliverError(err)
+	}
+}
+
 func (c *Conn) deliverPending(requestID uint64, pending pendingCall, response clientResponse) {
 	switch call := pending.(type) {
 	case syncPendingCall:
@@ -1149,14 +1845,14 @@ func (c *Conn) closeWithError(err error) {
 
 		close(c.closed)
 
+		_ = c.conn.Close()
+		c.failStreams(err)
 		c.requestMu.Lock()
 		for _, cancel := range c.requests {
 			cancel()
 		}
 		c.requests = make(map[uint64]context.CancelFunc)
 		c.requestMu.Unlock()
-
-		_ = c.conn.Close()
 		c.failPending(err)
 	})
 }

@@ -18,7 +18,8 @@ This is meant to keep the useful shape of `net/rpc` without inheriting gob as th
 - Shared Go request/response structs
 - Synchronous and asynchronous unary request/response calls from either side
 - One-way notifications/push messages from either side
-- Request IDs in every request/response/notification frame
+- Server streaming, client streaming, and bidirectional streaming from either side
+- Request IDs in every request, response, notification, and stream frame
 - Context deadline propagation and best-effort cancel frames
 - Client-side correlation IDs for asynchronous callbacks
 - Message-scoped `*gorpc.Context` with client name, request/notification ID, function, and connection addresses
@@ -31,11 +32,11 @@ This is meant to keep the useful shape of `net/rpc` without inheriting gob as th
 
 `Server.ServeTCP`, `Server.ServeUnix`, and `Server.ServeUnixPacket` cover the common listener cases. `Server.ServeListener` accepts any existing `net.Listener`.
 
-The words server and client only describe who accepts the connection and who initiates it. Once connected, both sides can register functions, send requests, receive responses, send one-way notifications, and handle incoming messages over the same full-duplex connection.
+The words server and client only describe who accepts the connection and who initiates it. Once connected, both sides can register functions, send requests, receive responses, send one-way notifications, open streams, and handle incoming messages over the same full-duplex connection.
 
-`TCPDial`, `UnixDial`, and `UnixPacketDial` establish the first connection, then the returned client keeps monitoring and reconnecting until `Close` is called. Reconnect attempts are intentionally aggressive: quick retry, exponential backoff capped at seconds, jitter, explicit dial timeouts, write deadlines, and ping/pong stale-connection detection. The lower-level `Dial` accepts a context, network, address, and full `ClientOptions` when you need explicit startup control. Use `NewTCPClient`, `NewUnixClient`, or `NewUnixPacketClient` when the dialing side needs to register functions before connecting. `Client.Call`, `Client.CallWithTimeout`, and `Client.CallContext` cover synchronous calls. `Client.AsyncCall` sends the request and invokes a typed callback when the response arrives. `Client.Notify` sends a one-way message and returns after the frame is written locally. Calls made while disconnected wait for the next connection; timeout/context variants bound that wait. Calls already in flight when a connection drops fail with `ErrUnavailable`; GoRPC does not silently replay them because the remote side may already have processed the request.
+`TCPDial`, `UnixDial`, and `UnixPacketDial` establish the first connection, then the returned client keeps monitoring and reconnecting until `Close` is called. Reconnect attempts are intentionally aggressive: quick retry, exponential backoff capped at seconds, jitter, explicit dial timeouts, write deadlines, and ping/pong stale-connection detection. The lower-level `Dial` accepts a context, network, address, and full `ClientOptions` when you need explicit startup control. Use `NewTCPClient`, `NewUnixClient`, or `NewUnixPacketClient` when the dialing side needs to register functions before connecting. `Client.Call`, `Client.CallWithTimeout`, and `Client.CallContext` cover synchronous calls. `Client.AsyncCall` sends the request and invokes a typed callback when the response arrives. `Client.Notify` sends a one-way message and returns after the frame is written locally. Calls made while disconnected wait for the next connection; timeout/context variants bound that wait. Calls and streams already in flight when a connection drops fail with `ErrUnavailable`; GoRPC does not silently replay them because the remote side may already have processed the request or some stream items.
 
-Streaming, service discovery, pub/sub, load balancing, and generated code are intentionally out of v1.
+Service discovery, pub/sub, load balancing, and generated code are intentionally out of v1.
 
 Shared-secret auth is optional. The secret is not sent over the wire; GoRPC uses a handshake challenge and HMAC-SHA256 proof.
 
@@ -202,6 +203,168 @@ if err := client.Notify("item_changed", ItemChanged{ID: "widget-001"}); err != n
 ```
 
 For server-initiated calls outside an existing request handler, use `ServerOptions.OnConnect` or `server.Connections()` to get a `*gorpc.Conn`, then call `conn.Call`, `conn.CallWithTimeout`, or `conn.AsyncCall`.
+
+## Streaming
+
+GoRPC supports the three normal stream shapes without generated stubs:
+
+- `RegisterServerStream` + `ServerStream`: one request in, many items out.
+- `RegisterClientStream` + `ClientStream`: many items in, one response out.
+- `RegisterBidiStream` + `BidiStream`: both sides send and receive items.
+
+The names describe the stream shape, not which process accepted the socket. Either side can register stream handlers, and either side can open streams. Use a `*gorpc.Client` when the dialing side opens a stream. Use a `*gorpc.Conn` when the accepted side opens a stream back to the dialing side.
+
+Server streaming:
+
+```go
+type ListItemsRequest struct {
+	Prefix string
+	Count  int
+}
+
+type ItemEvent struct {
+	Value string
+}
+
+gorpc.MustRegisterServerStream(server, "list_items", func(ctx *gorpc.Context, req ListItemsRequest, stream *gorpc.StreamWriter[ItemEvent]) error {
+	for i := 1; i <= req.Count; i++ {
+		if err := stream.Send(ItemEvent{Value: fmt.Sprintf("%s-%d", req.Prefix, i)}); err != nil {
+			return err
+		}
+	}
+	return nil
+})
+
+reader, err := gorpc.ServerStream[ListItemsRequest, ItemEvent](context.Background(), client, "list_items", ListItemsRequest{
+	Prefix: "widget",
+	Count:  3,
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+for {
+	item, err := reader.Recv()
+	if errors.Is(err, io.EOF) {
+		break
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(item.Value)
+}
+```
+
+Client streaming:
+
+```go
+type UploadSummary struct {
+	Count int
+}
+
+gorpc.MustRegisterClientStream(server, "upload_items", func(ctx *gorpc.Context, reader *gorpc.StreamReader[ItemEvent]) (UploadSummary, error) {
+	count := 0
+	for {
+		item, err := reader.Recv()
+		if errors.Is(err, io.EOF) {
+			return UploadSummary{Count: count}, nil
+		}
+		if err != nil {
+			return UploadSummary{}, err
+		}
+		_ = item
+		count++
+	}
+})
+
+stream, err := gorpc.ClientStream[ItemEvent, UploadSummary](context.Background(), client, "upload_items")
+if err != nil {
+	log.Fatal(err)
+}
+
+_ = stream.Send(ItemEvent{Value: "alpha"})
+_ = stream.Send(ItemEvent{Value: "bravo"})
+
+summary, err := stream.CloseAndRecv()
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(summary.Count)
+```
+
+Bidirectional streaming:
+
+```go
+gorpc.MustRegisterBidiStream(server, "echo_items", func(ctx *gorpc.Context, stream *gorpc.BidiStreamHandle[ItemEvent, ItemEvent]) error {
+	for {
+		item, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := stream.Send(ItemEvent{Value: strings.ToUpper(item.Value)}); err != nil {
+			return err
+		}
+	}
+})
+
+stream, err := gorpc.BidiStream[ItemEvent, ItemEvent](context.Background(), client, "echo_items")
+if err != nil {
+	log.Fatal(err)
+}
+
+_ = stream.Send(ItemEvent{Value: "alpha"})
+reply, err := stream.Recv()
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(reply.Value)
+
+_ = stream.CloseSend()
+```
+
+Server-initiated streaming uses the same helpers with a `*gorpc.Conn`:
+
+```go
+server := gorpc.NewServer(gorpc.ServerOptions{
+	OnConnect: func(conn *gorpc.Conn) {
+		reader, err := gorpc.ServerStream[ListItemsRequest, ItemEvent](context.Background(), conn, "client_list_items", ListItemsRequest{
+			Prefix: "client",
+			Count:  2,
+		})
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		for {
+			item, err := reader.Recv()
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			log.Println(item.Value)
+		}
+	},
+})
+```
+
+Streaming rules:
+
+- `Recv` returns `io.EOF` after the remote side closes cleanly.
+- `CloseSend` half-closes the local send side. It does not stop receiving.
+- `Cancel` sends a best-effort cancel frame and ends the whole stream locally.
+- Each stream item is one GoRPC frame and must fit `MaxFrameSize`; the default is 64 MiB per frame.
+- Streaming avoids building one huge response, but it does not bypass the per-frame limit.
+- If the connection breaks mid-stream, the active stream fails with `ErrUnavailable`.
+- The client keeps reconnecting after a break. New calls and new streams can use the new connection.
+- GoRPC does not replay active streams after reconnect. Retrying is application logic because the other side may already have processed some items.
+
+For the deeper implementation guide, see [docs/streaming.md](docs/streaming.md).
 
 ## Runnable Example
 

@@ -18,6 +18,8 @@ type Context struct {
 	localAddr  net.Addr
 	conn       *Conn
 	notify     bool
+	stream     bool
+	streamKind StreamKind
 }
 
 var _ context.Context = (*Context)(nil)
@@ -57,6 +59,25 @@ func (c *Context) IsNotify() bool {
 	}
 
 	return c.notify
+}
+
+// IsStream reports whether the inbound message opened a stream.
+func (c *Context) IsStream() bool {
+	if c == nil {
+		return false
+	}
+
+	return c.stream
+}
+
+// StreamKind returns the stream shape for streaming handlers. For non-stream
+// handlers it returns zero.
+func (c *Context) StreamKind() StreamKind {
+	if c == nil {
+		return 0
+	}
+
+	return c.streamKind
 }
 
 // RemoteAddr returns the peer address for the connection.
@@ -146,4 +167,12 @@ func (c *Context) NotifyContext(ctx context.Context, function string, req any) e
 	}
 
 	return c.conn.NotifyContext(ctx, function, req)
+}
+
+func contextFromFrame(frame Frame) (context.Context, context.CancelFunc) {
+	if frame.DeadlineUnixNano > 0 {
+		return context.WithDeadline(context.Background(), time.Unix(0, frame.DeadlineUnixNano))
+	}
+
+	return context.WithCancel(context.Background())
 }

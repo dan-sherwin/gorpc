@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [v0.5.0] - 2026-07-06
+### Added
+- Added server streaming, client streaming, and bidirectional streaming with typed helpers and handlers.
+- Added stream handlers on both `*Server` and `*Client`, so either side can open streams after connection establishment.
+- Added active stream failure on connection loss; streams fail with `ErrUnavailable` while the dialing client keeps reconnecting for future calls and streams.
+
 ## [v0.4.0] - 2026-07-05
 ### Added
 - Added one-way notifications over established connections with `RegisterNotify`, `MustRegisterNotify`, `Client.Notify`, `Conn.Notify`, and `Context.Notify`.
@@ -47,6 +53,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Optional `slog` debug logging hooks.
 - CI workflow covering tidy, build, vet, race tests, lint, and govulncheck.
 
+[v0.5.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.5.0
 [v0.4.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.4.0
 [v0.3.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.3.0
 [v0.2.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.2.0

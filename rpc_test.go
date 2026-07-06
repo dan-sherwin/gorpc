@@ -3,6 +3,8 @@ package gorpc
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -30,6 +32,20 @@ type clientInfoResponse struct {
 type itemChangedNotification struct {
 	ID   string
 	Name string
+}
+
+type streamListRequest struct {
+	Prefix string
+	Count  int
+}
+
+type streamItem struct {
+	Value string
+}
+
+type streamSummary struct {
+	Count  int
+	Joined string
 }
 
 func TestUnaryRoundTrip(t *testing.T) {
@@ -563,6 +579,466 @@ func TestConcurrentCallsOnSingleConnection(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestServerStreamClientToServer(t *testing.T) {
+	server, address, shutdown := startTestServer(t)
+	defer shutdown()
+
+	MustRegisterServerStream(server, "list_items", func(ctx *Context, req streamListRequest, stream *StreamWriter[streamItem]) error {
+		if !ctx.IsStream() {
+			return errors.New("context did not mark stream")
+		}
+		if ctx.StreamKind() != StreamKindServer {
+			return fmt.Errorf("stream kind = %s", ctx.StreamKind().String())
+		}
+
+		for i := 1; i <= req.Count; i++ {
+			if err := stream.Send(streamItem{Value: fmt.Sprintf("%s-%d", req.Prefix, i)}); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	client, err := TCPDial(address, "server-stream-test-client", ClientOptions{
+		PingInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	reader, err := ServerStream[streamListRequest, streamItem](context.Background(), client, "list_items", streamListRequest{
+		Prefix: "widget",
+		Count:  3,
+	})
+	if err != nil {
+		t.Fatalf("server stream: %v", err)
+	}
+
+	var values []string
+	for {
+		item, err := reader.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("recv: %v", err)
+		}
+		values = append(values, item.Value)
+	}
+
+	if strings.Join(values, ",") != "widget-1,widget-2,widget-3" {
+		t.Fatalf("values = %v", values)
+	}
+}
+
+func TestClientStreamClientToServer(t *testing.T) {
+	server, address, shutdown := startTestServer(t)
+	defer shutdown()
+
+	MustRegisterClientStream(server, "upload_items", func(ctx *Context, reader *StreamReader[streamItem]) (streamSummary, error) {
+		if !ctx.IsStream() || ctx.StreamKind() != StreamKindClient {
+			return streamSummary{}, errors.New("context did not mark client stream")
+		}
+
+		var values []string
+		for {
+			item, err := reader.Recv()
+			if errors.Is(err, io.EOF) {
+				return streamSummary{
+					Count:  len(values),
+					Joined: strings.Join(values, ","),
+				}, nil
+			}
+			if err != nil {
+				return streamSummary{}, err
+			}
+			values = append(values, item.Value)
+		}
+	})
+
+	client, err := TCPDial(address, "client-stream-test-client", ClientOptions{
+		PingInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	stream, err := ClientStream[streamItem, streamSummary](context.Background(), client, "upload_items")
+	if err != nil {
+		t.Fatalf("client stream: %v", err)
+	}
+	for _, value := range []string{"alpha", "bravo", "charlie"} {
+		if err := stream.Send(streamItem{Value: value}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+
+	resp, err := stream.CloseAndRecv()
+	if err != nil {
+		t.Fatalf("close and recv: %v", err)
+	}
+	if resp.Count != 3 || resp.Joined != "alpha,bravo,charlie" {
+		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestBidiStreamClientToServer(t *testing.T) {
+	server, address, shutdown := startTestServer(t)
+	defer shutdown()
+
+	MustRegisterBidiStream(server, "echo_items", func(ctx *Context, stream *BidiStreamHandle[streamItem, streamItem]) error {
+		if !ctx.IsStream() || ctx.StreamKind() != StreamKindBidi {
+			return errors.New("context did not mark bidi stream")
+		}
+
+		for {
+			item, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := stream.Send(streamItem{Value: strings.ToUpper(item.Value)}); err != nil {
+				return err
+			}
+		}
+	})
+
+	client, err := TCPDial(address, "bidi-stream-test-client", ClientOptions{
+		PingInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	stream, err := BidiStream[streamItem, streamItem](context.Background(), client, "echo_items")
+	if err != nil {
+		t.Fatalf("bidi stream: %v", err)
+	}
+	for _, value := range []string{"alpha", "bravo"} {
+		if err := stream.Send(streamItem{Value: value}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		resp, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("recv: %v", err)
+		}
+		if resp.Value != strings.ToUpper(value) {
+			t.Fatalf("resp = %+v", resp)
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("close send: %v", err)
+	}
+	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
+		t.Fatalf("final recv err = %v, want EOF", err)
+	}
+}
+
+func TestServerCanOpenServerStreamToClient(t *testing.T) {
+	results := make(chan []string, 1)
+	errs := make(chan error, 1)
+
+	_, address, shutdown := startTestServerWithOptions(t, ServerOptions{
+		OnConnect: func(conn *Conn) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+
+			reader, err := ServerStream[streamListRequest, streamItem](ctx, conn, "client_list_items", streamListRequest{
+				Prefix: "client",
+				Count:  2,
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+
+			var values []string
+			for {
+				item, err := reader.Recv()
+				if errors.Is(err, io.EOF) {
+					results <- values
+					return
+				}
+				if err != nil {
+					errs <- err
+					return
+				}
+				values = append(values, item.Value)
+			}
+		},
+	})
+	defer shutdown()
+
+	client := NewTCPClient(address, "server-open-server-stream-client", ClientOptions{
+		PingInterval: -1,
+	})
+	MustRegisterServerStream(client, "client_list_items", func(_ *Context, req streamListRequest, stream *StreamWriter[streamItem]) error {
+		for i := 1; i <= req.Count; i++ {
+			if err := stream.Send(streamItem{Value: fmt.Sprintf("%s-%d", req.Prefix, i)}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	select {
+	case err := <-errs:
+		t.Fatalf("server opened stream: %v", err)
+	case values := <-results:
+		if strings.Join(values, ",") != "client-1,client-2" {
+			t.Fatalf("values = %v", values)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server initiated stream did not complete")
+	}
+}
+
+func TestServerCanOpenClientStreamToClient(t *testing.T) {
+	results := make(chan streamSummary, 1)
+	errs := make(chan error, 1)
+
+	_, address, shutdown := startTestServerWithOptions(t, ServerOptions{
+		OnConnect: func(conn *Conn) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+
+			stream, err := ClientStream[streamItem, streamSummary](ctx, conn, "client_upload_items")
+			if err != nil {
+				errs <- err
+				return
+			}
+			for _, value := range []string{"one", "two"} {
+				if err := stream.Send(streamItem{Value: value}); err != nil {
+					errs <- err
+					return
+				}
+			}
+			resp, err := stream.CloseAndRecv()
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- resp
+		},
+	})
+	defer shutdown()
+
+	client := NewTCPClient(address, "server-open-client-stream-client", ClientOptions{
+		PingInterval: -1,
+	})
+	MustRegisterClientStream(client, "client_upload_items", func(_ *Context, reader *StreamReader[streamItem]) (streamSummary, error) {
+		var values []string
+		for {
+			item, err := reader.Recv()
+			if errors.Is(err, io.EOF) {
+				return streamSummary{Count: len(values), Joined: strings.Join(values, ",")}, nil
+			}
+			if err != nil {
+				return streamSummary{}, err
+			}
+			values = append(values, item.Value)
+		}
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	select {
+	case err := <-errs:
+		t.Fatalf("server opened client stream: %v", err)
+	case resp := <-results:
+		if resp.Count != 2 || resp.Joined != "one,two" {
+			t.Fatalf("resp = %+v", resp)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server initiated client stream did not complete")
+	}
+}
+
+func TestServerCanOpenBidiStreamToClient(t *testing.T) {
+	results := make(chan []string, 1)
+	errs := make(chan error, 1)
+
+	_, address, shutdown := startTestServerWithOptions(t, ServerOptions{
+		OnConnect: func(conn *Conn) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+
+			stream, err := BidiStream[streamItem, streamItem](ctx, conn, "client_echo_items")
+			if err != nil {
+				errs <- err
+				return
+			}
+
+			var values []string
+			for _, value := range []string{"red", "blue"} {
+				if err := stream.Send(streamItem{Value: value}); err != nil {
+					errs <- err
+					return
+				}
+				item, err := stream.Recv()
+				if err != nil {
+					errs <- err
+					return
+				}
+				values = append(values, item.Value)
+			}
+			if err := stream.CloseSend(); err != nil {
+				errs <- err
+				return
+			}
+			if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
+				errs <- err
+				return
+			}
+			results <- values
+		},
+	})
+	defer shutdown()
+
+	client := NewTCPClient(address, "server-open-bidi-stream-client", ClientOptions{
+		PingInterval: -1,
+	})
+	MustRegisterBidiStream(client, "client_echo_items", func(_ *Context, stream *BidiStreamHandle[streamItem, streamItem]) error {
+		for {
+			item, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := stream.Send(streamItem{Value: item.Value + "-client"}); err != nil {
+				return err
+			}
+		}
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	select {
+	case err := <-errs:
+		t.Fatalf("server opened bidi stream: %v", err)
+	case values := <-results:
+		if strings.Join(values, ",") != "red-client,blue-client" {
+			t.Fatalf("values = %v", values)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server initiated bidi stream did not complete")
+	}
+}
+
+func TestStreamFailsOnConnectionLossAndClientReconnects(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	address := ln.Addr().String()
+
+	server := NewServer(ServerOptions{})
+	MustRegisterServerStream(server, "slow_items", func(ctx *Context, _ streamListRequest, stream *StreamWriter[streamItem]) error {
+		if err := stream.Send(streamItem{Value: "first"}); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.ServeListener(ln)
+	}()
+	shutdownFirst := func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			t.Fatalf("shutdown first: %v", err)
+		}
+		if err := <-errCh; err != nil {
+			t.Fatalf("serve first: %v", err)
+		}
+	}
+
+	client, err := Dial(context.Background(), "tcp", address, reconnectTestOptions())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	reader, err := ServerStream[streamListRequest, streamItem](context.Background(), client, "slow_items", streamListRequest{})
+	if err != nil {
+		t.Fatalf("server stream: %v", err)
+	}
+	item, err := reader.Recv()
+	if err != nil {
+		t.Fatalf("first recv: %v", err)
+	}
+	if item.Value != "first" {
+		t.Fatalf("item = %+v", item)
+	}
+
+	shutdownFirst()
+
+	streamErr := make(chan error, 1)
+	go func() {
+		_, err := reader.Recv()
+		streamErr <- err
+	}()
+
+	select {
+	case err := <-streamErr:
+		if !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("stream err = %v, want ErrUnavailable", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not fail after connection loss")
+	}
+
+	_, shutdownSecond := startInventoryServerAt(t, address, "after stream reconnect")
+	defer shutdownSecond()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var resp getItemResponse
+	if err := client.CallContext(ctx, "get_an_item", getItemRequest{ID: "reconnected"}, &resp); err != nil {
+		t.Fatalf("call after reconnect: %v", err)
+	}
+	if resp.Name != "after stream reconnect" {
+		t.Fatalf("resp = %+v", resp)
 	}
 }
 
