@@ -10,6 +10,28 @@ import (
 
 const streamRecvBuffer = 16
 
+// StreamOptions configures newly opened streams. Zero values keep GoRPC
+// defaults.
+type StreamOptions struct {
+	RecvBuffer int
+}
+
+func normalizeStreamOptions(opts StreamOptions) StreamOptions {
+	if opts.RecvBuffer <= 0 {
+		opts.RecvBuffer = streamRecvBuffer
+	}
+
+	return opts
+}
+
+func mergeStreamOptions(base, override StreamOptions) StreamOptions {
+	if override.RecvBuffer > 0 {
+		base.RecvBuffer = override.RecvBuffer
+	}
+
+	return normalizeStreamOptions(base)
+}
+
 // Stream is the raw bidirectional item stream used by the typed streaming
 // helpers. Most callers should prefer ServerStream, ClientStream, BidiStream,
 // and the typed handler registration functions.
@@ -26,9 +48,10 @@ type Stream struct {
 	recvCh   chan streamDelivery
 	recvDone chan struct{}
 
-	sendClosed atomic.Bool
-	recvClosed atomic.Bool
-	done       atomic.Bool
+	receivesItems bool
+	sendClosed    atomic.Bool
+	recvClosed    atomic.Bool
+	done          atomic.Bool
 
 	closeSendOnce sync.Once
 	cancelOnce    sync.Once
@@ -44,20 +67,22 @@ type streamDelivery struct {
 	end     bool
 }
 
-func newStream(ctx context.Context, requestID uint64, function string, codec Codec, write func(Frame) error, onDone func(uint64)) *Stream {
+func newStreamWithOptions(ctx context.Context, requestID uint64, function string, codec Codec, write func(Frame) error, onDone func(uint64), opts StreamOptions) *Stream {
 	ctx = normalizeContext(ctx)
 	streamCtx, cancel := context.WithCancel(ctx)
+	opts = normalizeStreamOptions(opts)
 
 	return &Stream{
-		requestID: requestID,
-		function:  function,
-		codec:     defaultCodec(codec),
-		write:     write,
-		onDone:    onDone,
-		ctx:       streamCtx,
-		cancel:    cancel,
-		recvCh:    make(chan streamDelivery, streamRecvBuffer),
-		recvDone:  make(chan struct{}),
+		requestID:     requestID,
+		function:      function,
+		codec:         defaultCodec(codec),
+		write:         write,
+		onDone:        onDone,
+		ctx:           streamCtx,
+		cancel:        cancel,
+		recvCh:        make(chan streamDelivery, opts.RecvBuffer),
+		recvDone:      make(chan struct{}),
+		receivesItems: true,
 	}
 }
 
@@ -421,6 +446,7 @@ func (s *ClientStreamHandle[Item, Resp]) CloseAndRecv() (Resp, error) {
 	if s == nil || s.stream == nil {
 		return resp, ErrClosed
 	}
+	defer s.stream.finish(ErrClosed)
 
 	if err := s.stream.CloseSend(); err != nil {
 		return resp, err
@@ -517,9 +543,9 @@ func (s *BidiStreamHandle[Send, Recv]) Stream() *Stream {
 }
 
 type streamTarget interface {
-	openServerStream(ctx context.Context, function string, req any) (*Stream, error)
-	openClientStream(ctx context.Context, function string) (*Stream, chan clientResponse, func(uint64), Codec, error)
-	openBidiStream(ctx context.Context, function string) (*Stream, error)
+	openServerStream(ctx context.Context, function string, req any, opts StreamOptions) (*Stream, error)
+	openClientStream(ctx context.Context, function string, opts StreamOptions) (*Stream, chan clientResponse, func(uint64), Codec, error)
+	openBidiStream(ctx context.Context, function string, opts StreamOptions) (*Stream, error)
 }
 
 // ServerStream opens a server-streaming call. The caller sends one request and
@@ -528,12 +554,17 @@ type streamTarget interface {
 // The target can be either *Client or an accepted *Conn, so either connected
 // side can open a stream to the other side.
 func ServerStream[Req, Item any](ctx context.Context, target any, function string, req Req) (*StreamReader[Item], error) {
+	return ServerStreamWithOptions[Req, Item](ctx, target, function, req, StreamOptions{})
+}
+
+// ServerStreamWithOptions opens a server-streaming call with stream options.
+func ServerStreamWithOptions[Req, Item any](ctx context.Context, target any, function string, req Req, opts StreamOptions) (*StreamReader[Item], error) {
 	endpoint, err := asStreamTarget(target)
 	if err != nil {
 		return nil, err
 	}
 
-	stream, err := endpoint.openServerStream(ctx, function, req)
+	stream, err := endpoint.openServerStream(ctx, function, req, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -547,12 +578,17 @@ func ServerStream[Req, Item any](ctx context.Context, target any, function strin
 // The target can be either *Client or an accepted *Conn, so either connected
 // side can open a stream to the other side.
 func ClientStream[Item, Resp any](ctx context.Context, target any, function string) (*ClientStreamHandle[Item, Resp], error) {
+	return ClientStreamWithOptions[Item, Resp](ctx, target, function, StreamOptions{})
+}
+
+// ClientStreamWithOptions opens a client-streaming call with stream options.
+func ClientStreamWithOptions[Item, Resp any](ctx context.Context, target any, function string, opts StreamOptions) (*ClientStreamHandle[Item, Resp], error) {
 	endpoint, err := asStreamTarget(target)
 	if err != nil {
 		return nil, err
 	}
 
-	stream, responseCh, removePending, codec, err := endpoint.openClientStream(ctx, function)
+	stream, responseCh, removePending, codec, err := endpoint.openClientStream(ctx, function, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -572,12 +608,17 @@ func ClientStream[Item, Resp any](ctx context.Context, target any, function stri
 // The target can be either *Client or an accepted *Conn, so either connected
 // side can open a stream to the other side.
 func BidiStream[Send, Recv any](ctx context.Context, target any, function string) (*BidiStreamHandle[Send, Recv], error) {
+	return BidiStreamWithOptions[Send, Recv](ctx, target, function, StreamOptions{})
+}
+
+// BidiStreamWithOptions opens a bidirectional stream with stream options.
+func BidiStreamWithOptions[Send, Recv any](ctx context.Context, target any, function string, opts StreamOptions) (*BidiStreamHandle[Send, Recv], error) {
 	endpoint, err := asStreamTarget(target)
 	if err != nil {
 		return nil, err
 	}
 
-	stream, err := endpoint.openBidiStream(ctx, function)
+	stream, err := endpoint.openBidiStream(ctx, function, opts)
 	if err != nil {
 		return nil, err
 	}

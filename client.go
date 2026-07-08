@@ -28,6 +28,7 @@ const (
 type ClientOptions struct {
 	ClientName       string
 	Codec            Codec
+	Compression      Compressor
 	MaxFrameSize     int64
 	HandshakeTimeout time.Duration
 	Auth             Auth
@@ -41,6 +42,12 @@ type ClientOptions struct {
 	ReconnectJitter   float64
 	PingInterval      time.Duration
 	PingTimeout       time.Duration
+
+	Backpressure      BackpressureOptions
+	StreamOptions     StreamOptions
+	UnaryInterceptor  UnaryInterceptor
+	NotifyInterceptor NotifyInterceptor
+	StreamInterceptor StreamInterceptor
 }
 
 // Client is the dialing side of a long-lived full-duplex GoRPC connection. It
@@ -52,6 +59,7 @@ type Client struct {
 	dialer  *net.Dialer
 
 	codec            Codec
+	compressor       Compressor
 	maxFrameSize     int64
 	handshakeTimeout time.Duration
 	auth             Auth
@@ -65,6 +73,16 @@ type Client struct {
 	reconnectJitter   float64
 	pingInterval      time.Duration
 	pingTimeout       time.Duration
+
+	backpressure  BackpressureOptions
+	writeLimiter  *writeLimiter
+	streamOptions StreamOptions
+
+	unaryInterceptor  UnaryInterceptor
+	notifyInterceptor NotifyInterceptor
+	streamInterceptor StreamInterceptor
+
+	singleflight singleflightGroup
 
 	nextID atomic.Uint64
 
@@ -173,12 +191,14 @@ func NewClient(network, address string, opts ClientOptions) *Client {
 	if dialer == nil {
 		dialer = &net.Dialer{}
 	}
+	backpressure := normalizeBackpressureOptions(opts.Backpressure)
 
 	client := &Client{
 		network:              network,
 		address:              address,
 		dialer:               dialer,
 		codec:                defaultCodec(opts.Codec),
+		compressor:           normalizeCompressor(opts.Compression),
 		maxFrameSize:         normalizeMaxFrameSize(opts.MaxFrameSize),
 		handshakeTimeout:     normalizeHandshakeTimeout(opts.HandshakeTimeout),
 		auth:                 opts.Auth,
@@ -191,6 +211,12 @@ func NewClient(network, address string, opts ClientOptions) *Client {
 		reconnectJitter:      normalizeReconnectJitter(opts.ReconnectJitter),
 		pingInterval:         normalizePingInterval(opts.PingInterval),
 		pingTimeout:          normalizePingTimeout(opts.PingTimeout),
+		backpressure:         backpressure,
+		writeLimiter:         newWriteLimiter(backpressure.MaxConcurrentWrites),
+		streamOptions:        normalizeStreamOptions(opts.StreamOptions),
+		unaryInterceptor:     opts.UnaryInterceptor,
+		notifyInterceptor:    opts.NotifyInterceptor,
+		streamInterceptor:    opts.StreamInterceptor,
 		ready:                make(chan struct{}),
 		reconnectCh:          make(chan struct{}, 1),
 		handlers:             make(map[string]handler),
@@ -292,33 +318,95 @@ func (c *Client) CallContext(ctx context.Context, function string, req any, resp
 	if c == nil {
 		return ErrClosed
 	}
-	ctx = normalizeContext(ctx)
 	if err := validateResponseTarget(resp); err != nil {
 		return err
 	}
 
+	frame, err := c.callFrameContext(ctx, function, req)
+	if err != nil {
+		return err
+	}
+
+	return decodeResponse(c.codec, frame, resp)
+}
+
+// CallSingleflight performs a unary request/response call and collapses
+// concurrent calls with the same function and key into one remote request.
+func (c *Client) CallSingleflight(function string, key string, req any, resp any) error {
+	return c.CallSingleflightContext(context.Background(), function, key, req, resp)
+}
+
+// CallSingleflightWithTimeout performs a singleflight unary call with a timeout.
+func (c *Client) CallSingleflightWithTimeout(function string, key string, req any, resp any, timeout time.Duration) error {
+	if timeout <= 0 {
+		return c.CallSingleflight(function, key, req, resp)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	return c.CallSingleflightContext(ctx, function, key, req, resp)
+}
+
+// CallSingleflightContext performs a unary call and shares one in-flight remote
+// request with concurrent callers using the same function and key. If key is
+// empty, GoRPC builds a key from the encoded request payload.
+func (c *Client) CallSingleflightContext(ctx context.Context, function string, key string, req any, resp any) error {
+	if c == nil {
+		return ErrClosed
+	}
+	if function == "" {
+		return ErrInvalidFunction
+	}
+	if err := validateResponseTarget(resp); err != nil {
+		return err
+	}
+
+	sfKey, err := singleflightKey(c.codec, function, key, req)
+	if err != nil {
+		return fmt.Errorf("encode singleflight key: %w", err)
+	}
+
+	frame, err := c.singleflight.do(ctx, sfKey, func() (Frame, error) {
+		return c.callFrameContext(ctx, function, req)
+	})
+	if err != nil {
+		return err
+	}
+
+	return decodeResponse(c.codec, frame, resp)
+}
+
+func (c *Client) callFrameContext(ctx context.Context, function string, req any) (Frame, error) {
+	if c == nil {
+		return Frame{}, ErrClosed
+	}
+	ctx = normalizeContext(ctx)
+
 	responseCh := make(chan clientResponse, 1)
 	requestID, err := c.sendRequest(ctx, function, req, syncPendingCall{ch: responseCh})
 	if err != nil {
-		return err
+		return Frame{}, err
 	}
 
 	select {
 	case response := <-responseCh:
 		if response.err != nil {
-			return response.err
+			return Frame{}, response.err
 		}
 
-		return decodeResponse(c.codec, response.frame, resp)
+		return response.frame, nil
 	case <-ctx.Done():
 		c.removePending(requestID)
 		if conn, ok := c.currentConn(); ok {
-			_ = c.writeTo(conn, Frame{Type: FrameCancel, RequestID: requestID})
+			if err := c.writeTo(conn, Frame{Type: FrameCancel, RequestID: requestID}); err != nil {
+				c.handleWriteError(conn, err)
+			}
 		}
-		return ctx.Err()
+		return Frame{}, ctx.Err()
 	case <-c.closed:
 		c.removePending(requestID)
-		return c.closedError()
+		return Frame{}, c.closedError()
 	}
 }
 
@@ -461,7 +549,7 @@ func (c *Client) sendRequest(ctx context.Context, function string, req any, pend
 
 	if err := c.writeTo(conn, frame); err != nil {
 		c.removePending(requestID)
-		c.connectionLost(conn, err)
+		c.handleWriteError(conn, err)
 		return 0, err
 	}
 
@@ -499,14 +587,14 @@ func (c *Client) sendNotify(ctx context.Context, function string, req any) (uint
 	}
 
 	if err := c.writeTo(conn, frame); err != nil {
-		c.connectionLost(conn, err)
+		c.handleWriteError(conn, err)
 		return 0, err
 	}
 
 	return requestID, nil
 }
 
-func (c *Client) openServerStream(ctx context.Context, function string, req any) (*Stream, error) {
+func (c *Client) openServerStream(ctx context.Context, function string, req any, opts StreamOptions) (*Stream, error) {
 	ctx = normalizeContext(ctx)
 	if c == nil {
 		return nil, ErrClosed
@@ -526,13 +614,14 @@ func (c *Client) openServerStream(ctx context.Context, function string, req any)
 	}
 
 	requestID := c.nextRequestID()
-	stream := newStream(ctx, requestID, function, c.codec, func(frame Frame) error {
+	streamOpts := mergeStreamOptions(c.streamOptions, opts)
+	stream := newStreamWithOptions(ctx, requestID, function, c.codec, func(frame Frame) error {
 		if err := c.writeTo(conn, frame); err != nil {
-			c.connectionLost(conn, err)
+			c.handleWriteError(conn, err)
 			return err
 		}
 		return nil
-	}, c.removeStream)
+	}, c.removeStream, streamOpts)
 
 	if err := c.addStream(stream); err != nil {
 		return nil, err
@@ -552,14 +641,14 @@ func (c *Client) openServerStream(ctx context.Context, function string, req any)
 	if err := c.writeTo(conn, frame); err != nil {
 		c.removeStream(requestID)
 		stream.deliverError(fmt.Errorf("%w: %v", ErrUnavailable, err))
-		c.connectionLost(conn, err)
+		c.handleWriteError(conn, err)
 		return nil, err
 	}
 
 	return stream, nil
 }
 
-func (c *Client) openClientStream(ctx context.Context, function string) (*Stream, chan clientResponse, func(uint64), Codec, error) {
+func (c *Client) openClientStream(ctx context.Context, function string, opts StreamOptions) (*Stream, chan clientResponse, func(uint64), Codec, error) {
 	ctx = normalizeContext(ctx)
 	if c == nil {
 		return nil, nil, nil, nil, ErrClosed
@@ -579,13 +668,19 @@ func (c *Client) openClientStream(ctx context.Context, function string) (*Stream
 		return nil, nil, nil, nil, err
 	}
 
-	stream := newStream(ctx, requestID, function, c.codec, func(frame Frame) error {
+	streamOpts := mergeStreamOptions(c.streamOptions, opts)
+	stream := newStreamWithOptions(ctx, requestID, function, c.codec, func(frame Frame) error {
 		if err := c.writeTo(conn, frame); err != nil {
-			c.connectionLost(conn, err)
+			c.handleWriteError(conn, err)
 			return err
 		}
 		return nil
-	}, nil)
+	}, c.removeStream, streamOpts)
+	stream.receivesItems = false
+	if err := c.addStream(stream); err != nil {
+		c.removePending(requestID)
+		return nil, nil, nil, nil, err
+	}
 
 	frame := Frame{
 		Type:       FrameStreamStart,
@@ -599,15 +694,16 @@ func (c *Client) openClientStream(ctx context.Context, function string) (*Stream
 
 	if err := c.writeTo(conn, frame); err != nil {
 		c.removePending(requestID)
+		c.removeStream(requestID)
 		stream.finish(fmt.Errorf("%w: %v", ErrUnavailable, err))
-		c.connectionLost(conn, err)
+		c.handleWriteError(conn, err)
 		return nil, nil, nil, nil, err
 	}
 
 	return stream, responseCh, c.removePending, c.codec, nil
 }
 
-func (c *Client) openBidiStream(ctx context.Context, function string) (*Stream, error) {
+func (c *Client) openBidiStream(ctx context.Context, function string, opts StreamOptions) (*Stream, error) {
 	ctx = normalizeContext(ctx)
 	if c == nil {
 		return nil, ErrClosed
@@ -622,13 +718,14 @@ func (c *Client) openBidiStream(ctx context.Context, function string) (*Stream, 
 	}
 
 	requestID := c.nextRequestID()
-	stream := newStream(ctx, requestID, function, c.codec, func(frame Frame) error {
+	streamOpts := mergeStreamOptions(c.streamOptions, opts)
+	stream := newStreamWithOptions(ctx, requestID, function, c.codec, func(frame Frame) error {
 		if err := c.writeTo(conn, frame); err != nil {
-			c.connectionLost(conn, err)
+			c.handleWriteError(conn, err)
 			return err
 		}
 		return nil
-	}, c.removeStream)
+	}, c.removeStream, streamOpts)
 
 	if err := c.addStream(stream); err != nil {
 		return nil, err
@@ -647,7 +744,7 @@ func (c *Client) openBidiStream(ctx context.Context, function string) (*Stream, 
 	if err := c.writeTo(conn, frame); err != nil {
 		c.removeStream(requestID)
 		stream.deliverError(fmt.Errorf("%w: %v", ErrUnavailable, err))
-		c.connectionLost(conn, err)
+		c.handleWriteError(conn, err)
 		return nil, err
 	}
 
@@ -1097,6 +1194,7 @@ func (c *Client) clientHandshake(conn net.Conn) error {
 		ProtocolVersion: ProtocolVersion,
 		Codec:           c.codec.Name(),
 		ClientName:      c.clientName,
+		Compression:     compressorName(c.compressor),
 		AuthMethod:      c.auth.method(),
 	})
 	if err != nil {
@@ -1127,6 +1225,12 @@ func (c *Client) clientHandshake(conn net.Conn) error {
 	}
 	if ack.Codec != c.codec.Name() {
 		return fmt.Errorf("%w: unsupported codec %q", ErrProtocol, ack.Codec)
+	}
+	if err := ensureCompressor(ack.Compression, c.compressor); err != nil {
+		return err
+	}
+	if c.compressor != nil && ack.Compression != c.compressor.Name() {
+		return fmt.Errorf("%w: compression %q was not accepted", ErrProtocol, c.compressor.Name())
 	}
 	if ack.AuthRequired {
 		if err := c.clientAuth(conn, ack); err != nil {
@@ -1191,14 +1295,14 @@ func (c *Client) clientAuth(conn net.Conn, ack helloAck) error {
 
 func (c *Client) readLoop(conn net.Conn) {
 	for {
-		frame, err := readFrame(conn, c.maxFrameSize, c.codec)
+		frame, err := readFrameWithCompression(conn, c.maxFrameSize, c.codec, c.compressor)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 				c.connectionLost(conn, ErrUnavailable)
 				return
 			}
 			c.logDebug("gorpc read failed", "error", err)
-			c.connectionLost(conn, err)
+			c.handleWriteError(conn, err)
 			return
 		}
 
@@ -1227,8 +1331,10 @@ func (c *Client) readLoop(conn net.Conn) {
 			c.cancel(frame.RequestID)
 		case FramePing:
 			if err := c.writeTo(conn, Frame{Type: FramePong, RequestID: frame.RequestID}); err != nil {
-				c.connectionLost(conn, err)
-				return
+				c.handleWriteError(conn, err)
+				if !errors.Is(err, ErrBackpressure) {
+					return
+				}
 			}
 		case FramePong:
 		default:
@@ -1297,18 +1403,20 @@ func (c *Client) startRequest(conn net.Conn, frame Frame) {
 			c.requestMu.Unlock()
 		}()
 
-		payload, err := h(rpcCtx, frame.Payload)
+		payload, err := invokeUnary(rpcCtx, frame.Payload, h, c.unaryInterceptor)
 		if err != nil {
 			_ = c.writeErrorTo(conn, frame, remoteErrorFromError(err))
 			return
 		}
 
-		_ = c.writeTo(conn, Frame{
+		if err := c.writeTo(conn, Frame{
 			Type:      FrameResponse,
 			RequestID: frame.RequestID,
 			Function:  frame.Function,
 			Payload:   payload,
-		})
+		}); err != nil {
+			c.handleWriteError(conn, err)
+		}
 	}()
 }
 
@@ -1361,7 +1469,7 @@ func (c *Client) startNotify(conn net.Conn, frame Frame) {
 			c.requestMu.Unlock()
 		}()
 
-		if err := h(rpcCtx, frame.Payload); err != nil {
+		if err := invokeNotify(rpcCtx, frame.Payload, h, c.notifyInterceptor); err != nil {
 			c.logDebug("gorpc notify handler failed", "function", frame.Function, "request_id", frame.RequestID, "error", err)
 		}
 	}()
@@ -1418,13 +1526,19 @@ func (c *Client) startServerStream(conn net.Conn, frame Frame) {
 		stream:     true,
 		streamKind: StreamKindServer,
 	}
-	stream := newStream(ctx, frame.RequestID, frame.Function, c.codec, func(writeFrame Frame) error {
+	stream := newStreamWithOptions(ctx, frame.RequestID, frame.Function, c.codec, func(writeFrame Frame) error {
 		if err := c.writeTo(conn, writeFrame); err != nil {
-			c.connectionLost(conn, err)
+			c.handleWriteError(conn, err)
 			return err
 		}
 		return nil
-	}, nil)
+	}, c.removeStream, c.streamOptions)
+	stream.receivesItems = false
+	if err := c.addStream(stream); err != nil {
+		_ = c.writeErrorTo(conn, frame, remoteErrorFromError(err))
+		cancel()
+		return
+	}
 
 	c.requestMu.Lock()
 	c.requests[frame.RequestID] = cancel
@@ -1438,13 +1552,15 @@ func (c *Client) startServerStream(conn net.Conn, frame Frame) {
 					Message: fmt.Sprintf("stream handler panic: %v", recovered),
 				})
 			}
+			c.removeStream(frame.RequestID)
+			stream.finish(ErrClosed)
 			cancel()
 			c.requestMu.Lock()
 			delete(c.requests, frame.RequestID)
 			c.requestMu.Unlock()
 		}()
 
-		if err := h(rpcCtx, frame.Payload, stream); err != nil {
+		if err := invokeServerStream(rpcCtx, frame.Payload, stream, h, c.streamInterceptor); err != nil {
 			_ = c.writeErrorTo(conn, frame, remoteErrorFromError(err))
 			stream.finish(err)
 			return
@@ -1474,13 +1590,13 @@ func (c *Client) startClientStream(conn net.Conn, frame Frame) {
 		stream:     true,
 		streamKind: StreamKindClient,
 	}
-	stream := newStream(ctx, frame.RequestID, frame.Function, c.codec, func(writeFrame Frame) error {
+	stream := newStreamWithOptions(ctx, frame.RequestID, frame.Function, c.codec, func(writeFrame Frame) error {
 		if err := c.writeTo(conn, writeFrame); err != nil {
-			c.connectionLost(conn, err)
+			c.handleWriteError(conn, err)
 			return err
 		}
 		return nil
-	}, c.removeStream)
+	}, c.removeStream, c.streamOptions)
 	if err := c.addStream(stream); err != nil {
 		_ = c.writeErrorTo(conn, frame, remoteErrorFromError(err))
 		cancel()
@@ -1507,18 +1623,20 @@ func (c *Client) startClientStream(conn net.Conn, frame Frame) {
 			c.requestMu.Unlock()
 		}()
 
-		payload, err := h(rpcCtx, stream)
+		payload, err := invokeClientStream(rpcCtx, stream, h, c.streamInterceptor)
 		if err != nil {
 			_ = c.writeErrorTo(conn, frame, remoteErrorFromError(err))
 			return
 		}
 
-		_ = c.writeTo(conn, Frame{
+		if err := c.writeTo(conn, Frame{
 			Type:      FrameResponse,
 			RequestID: frame.RequestID,
 			Function:  frame.Function,
 			Payload:   payload,
-		})
+		}); err != nil {
+			c.handleWriteError(conn, err)
+		}
 	}()
 }
 
@@ -1542,13 +1660,13 @@ func (c *Client) startBidiStream(conn net.Conn, frame Frame) {
 		stream:     true,
 		streamKind: StreamKindBidi,
 	}
-	stream := newStream(ctx, frame.RequestID, frame.Function, c.codec, func(writeFrame Frame) error {
+	stream := newStreamWithOptions(ctx, frame.RequestID, frame.Function, c.codec, func(writeFrame Frame) error {
 		if err := c.writeTo(conn, writeFrame); err != nil {
-			c.connectionLost(conn, err)
+			c.handleWriteError(conn, err)
 			return err
 		}
 		return nil
-	}, c.removeStream)
+	}, c.removeStream, c.streamOptions)
 	if err := c.addStream(stream); err != nil {
 		_ = c.writeErrorTo(conn, frame, remoteErrorFromError(err))
 		cancel()
@@ -1575,7 +1693,7 @@ func (c *Client) startBidiStream(conn net.Conn, frame Frame) {
 			c.requestMu.Unlock()
 		}()
 
-		if err := h(rpcCtx, stream); err != nil {
+		if err := invokeBidiStream(rpcCtx, stream, h, c.streamInterceptor); err != nil {
 			_ = c.writeErrorTo(conn, frame, remoteErrorFromError(err))
 			return
 		}
@@ -1600,12 +1718,17 @@ func (c *Client) writeErrorTo(conn net.Conn, request Frame, remoteErr RemoteErro
 		return err
 	}
 
-	return c.writeTo(conn, Frame{
+	err = c.writeTo(conn, Frame{
 		Type:      FrameError,
 		RequestID: request.RequestID,
 		Function:  request.Function,
 		Payload:   payload,
 	})
+	if err != nil {
+		c.handleWriteError(conn, err)
+	}
+
+	return err
 }
 
 func (c *Client) pingLoop(conn net.Conn) {
@@ -1626,8 +1749,12 @@ func (c *Client) pingLoop(conn net.Conn) {
 		start := time.Now()
 		requestID := c.nextRequestID()
 		if err := c.writeTo(conn, Frame{Type: FramePing, RequestID: requestID}); err != nil {
-			c.connectionLost(conn, err)
-			return
+			c.handleWriteError(conn, err)
+			if !errors.Is(err, ErrBackpressure) {
+				return
+			}
+			timer.Reset(c.pingInterval)
+			continue
 		}
 
 		select {
@@ -1694,6 +1821,15 @@ func (c *Client) addPending(requestID uint64, pending pendingCall) error {
 	case <-c.closed:
 		return c.closedError()
 	default:
+		if c.backpressure.MaxPendingCalls > 0 && len(c.pending) >= c.backpressure.MaxPendingCalls {
+			c.reportBackpressure(BackpressureInfo{
+				Side:      BackpressureSideClient,
+				Reason:    BackpressureReasonPendingCalls,
+				Limit:     c.backpressure.MaxPendingCalls,
+				RequestID: requestID,
+			})
+			return ErrBackpressure
+		}
 		c.pending[requestID] = pending
 		return nil
 	}
@@ -1758,6 +1894,16 @@ func (c *Client) addStream(stream *Stream) error {
 	case <-c.closed:
 		return c.closedError()
 	default:
+		if c.backpressure.MaxActiveStreams > 0 && len(c.streams) >= c.backpressure.MaxActiveStreams {
+			c.reportBackpressure(BackpressureInfo{
+				Side:      BackpressureSideClient,
+				Reason:    BackpressureReasonActiveStreams,
+				Limit:     c.backpressure.MaxActiveStreams,
+				RequestID: stream.RequestID(),
+				Function:  stream.Function(),
+			})
+			return ErrBackpressure
+		}
 		c.streams[stream.RequestID()] = stream
 		return nil
 	}
@@ -1785,8 +1931,14 @@ func (c *Client) deliverStreamFrame(frame Frame) bool {
 
 	switch frame.Type {
 	case FrameStreamItem:
+		if !stream.receivesItems {
+			return false
+		}
 		stream.deliverItem(frame)
 	case FrameStreamEnd:
+		if !stream.receivesItems {
+			return false
+		}
 		stream.deliverEnd()
 	case FrameError:
 		stream.deliverError(remoteErrorFromFrame(c.codec, frame))
@@ -1860,6 +2012,18 @@ func (c *Client) writeTo(conn net.Conn, frame Frame) error {
 	if !c.isCurrentConn(conn) {
 		return ErrUnavailable
 	}
+	if !c.writeLimiter.acquire() {
+		c.reportBackpressure(BackpressureInfo{
+			Side:      BackpressureSideClient,
+			Reason:    BackpressureReasonConcurrentWrites,
+			Limit:     c.backpressure.MaxConcurrentWrites,
+			RequestID: frame.RequestID,
+			Function:  frame.Function,
+			FrameType: frame.Type,
+		})
+		return ErrBackpressure
+	}
+	defer c.writeLimiter.release()
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -1877,7 +2041,19 @@ func (c *Client) writeTo(conn net.Conn, frame Frame) error {
 		}()
 	}
 
-	return writeFrame(conn, c.maxFrameSize, c.codec, frame)
+	return writeFrameWithCompression(conn, c.maxFrameSize, c.codec, c.compressor, frame)
+}
+
+func (c *Client) handleWriteError(conn net.Conn, err error) {
+	if err == nil || errors.Is(err, ErrBackpressure) {
+		return
+	}
+
+	c.connectionLost(conn, err)
+}
+
+func (c *Client) reportBackpressure(info BackpressureInfo) {
+	reportBackpressure(c.backpressure, info)
 }
 
 func (c *Client) closeWithError(err error) {

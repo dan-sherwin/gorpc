@@ -15,6 +15,7 @@ const (
 	ErrorCodeNotFound         = "not_found"
 	ErrorCodeUnauthorized     = "unauthorized"
 	ErrorCodeUnavailable      = "unavailable"
+	ErrorCodeBackpressure     = "backpressure"
 )
 
 // Common GoRPC errors.
@@ -26,6 +27,7 @@ var (
 	ErrInvalidHandler    = errors.New("gorpc: invalid handler")
 	ErrInvalidResponse   = errors.New("gorpc: invalid response")
 	ErrUnavailable       = errors.New("gorpc: unavailable")
+	ErrBackpressure      = errors.New("gorpc: backpressure")
 )
 
 // RemoteError is sent in FrameError payloads and returned by callers when the
@@ -74,6 +76,8 @@ func remoteErrorFromError(err error) RemoteError {
 		return RemoteError{Code: ErrorCodeCanceled, Message: err.Error()}
 	case errors.Is(err, context.DeadlineExceeded):
 		return RemoteError{Code: ErrorCodeDeadlineExceeded, Message: err.Error()}
+	case errors.Is(err, ErrBackpressure):
+		return RemoteError{Code: ErrorCodeBackpressure, Message: err.Error()}
 	default:
 		return RemoteError{Code: ErrorCodeInternal, Message: err.Error()}
 	}

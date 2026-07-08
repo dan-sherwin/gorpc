@@ -15,14 +15,19 @@ This is meant to keep the useful shape of `net/rpc` without inheriting gob as th
 - Automatic client reconnect with exponential backoff
 - Ping/pong connection monitoring
 - Length-prefixed MessagePack frames
+- Optional gzip payload compression
 - Shared Go request/response structs
 - Synchronous and asynchronous unary request/response calls from either side
+- Explicit singleflight unary calls for duplicate in-flight work
 - One-way notifications/push messages from either side
+- Broadcast notifications from a server to all accepted connections
 - Server streaming, client streaming, and bidirectional streaming from either side
 - Request IDs in every request, response, notification, and stream frame
 - Context deadline propagation and best-effort cancel frames
 - Client-side correlation IDs for asynchronous callbacks
 - Message-scoped `*gorpc.Context` with client name, request/notification ID, function, and connection addresses
+- Optional inbound interceptors for unary, notification, and stream handlers
+- Optional backpressure limits for pending calls, active streams, and concurrent writes
 - Structured remote errors
 - Max frame size enforcement
 - Basic protocol/version/codec handshake with optional client name metadata
@@ -203,6 +208,19 @@ if err := client.Notify("item_changed", ItemChanged{ID: "widget-001"}); err != n
 ```
 
 For server-initiated calls outside an existing request handler, use `ServerOptions.OnConnect` or `server.Connections()` to get a `*gorpc.Conn`, then call `conn.Call`, `conn.CallWithTimeout`, or `conn.AsyncCall`.
+
+## Operational Options
+
+GoRPC defaults are deliberately small: MessagePack, no compression, no backpressure limits, no interceptors, and no broadcast behavior unless you call it. The optional knobs are additive:
+
+- `gorpc.GzipCompression()` enables payload compression when both peers configure it.
+- `BackpressureOptions` can reject new local work with `ErrBackpressure` before memory grows without bound.
+- `UnaryInterceptor`, `NotifyInterceptor`, and `StreamInterceptor` wrap inbound dispatch for logging, metrics, authorization, or payload inspection.
+- `Client.CallSingleflight...` and `Conn.CallSingleflight...` collapse duplicate in-flight unary calls with the same function/key.
+- `Server.NotifyAll...` sends one notification to every currently accepted connection.
+- `StreamOptions{RecvBuffer: n}` adjusts the per-stream receive buffer globally or per stream.
+
+See [docs/options.md](docs/options.md) for examples and exact behavior.
 
 ## Streaming
 

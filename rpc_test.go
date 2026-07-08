@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1334,6 +1335,331 @@ func TestClientMaxFrameSize(t *testing.T) {
 	}, &resp)
 	if !errors.Is(err, ErrFrameTooLarge) {
 		t.Fatalf("err = %v, want ErrFrameTooLarge", err)
+	}
+}
+
+func TestCompressionRoundTrip(t *testing.T) {
+	server, address, shutdown := startTestServerWithOptions(t, ServerOptions{
+		Compression: GzipCompression(),
+	})
+	defer shutdown()
+
+	MustRegister(server, "get_an_item", func(_ *Context, req getItemRequest) (getItemResponse, error) {
+		return getItemResponse{
+			ID:   req.ID,
+			Name: strings.Repeat("compressed-widget-", 256),
+		}, nil
+	})
+
+	client, err := TCPDial(address, "compression-test-client", ClientOptions{
+		Compression:  GzipCompression(),
+		PingInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	var resp getItemResponse
+	if err := client.Call("get_an_item", getItemRequest{ID: strings.Repeat("abc123", 128)}, &resp); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if resp.ID == "" || !strings.Contains(resp.Name, "compressed-widget") {
+		t.Fatalf("resp = %+v", resp)
+	}
+
+	plainClient, err := TCPDial(address, "plain-test-client", ClientOptions{
+		PingInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("plain dial: %v", err)
+	}
+	defer func() {
+		_ = plainClient.Close()
+	}()
+
+	var plainResp getItemResponse
+	if err := plainClient.Call("get_an_item", getItemRequest{ID: "plain"}, &plainResp); err != nil {
+		t.Fatalf("plain call: %v", err)
+	}
+	if plainResp.ID != "plain" {
+		t.Fatalf("plain resp = %+v", plainResp)
+	}
+}
+
+func TestInterceptorsWrapInboundHandlers(t *testing.T) {
+	events := make(chan string, 3)
+	server, address, shutdown := startTestServerWithOptions(t, ServerOptions{
+		UnaryInterceptor: func(ctx *Context, req UnaryRequest, next UnaryHandler) ([]byte, error) {
+			if len(req.Payload) == 0 {
+				return nil, errors.New("unary interceptor saw empty payload")
+			}
+			events <- "unary:" + ctx.Function()
+			return next(ctx, req)
+		},
+		NotifyInterceptor: func(ctx *Context, req NotifyRequest, next NotifyHandler) error {
+			if len(req.Payload) == 0 {
+				return errors.New("notify interceptor saw empty payload")
+			}
+			events <- "notify:" + ctx.Function()
+			return next(ctx, req)
+		},
+		StreamInterceptor: func(ctx *Context, req StreamRequest, stream *Stream, next StreamHandler) ([]byte, error) {
+			if req.Kind != StreamKindServer {
+				return nil, fmt.Errorf("stream kind = %s", req.Kind.String())
+			}
+			if len(req.Payload) == 0 {
+				return nil, errors.New("stream interceptor saw empty payload")
+			}
+			events <- "stream:" + ctx.Function()
+			return next(ctx, req, stream)
+		},
+	})
+	defer shutdown()
+
+	MustRegister(server, "get_an_item", func(_ *Context, req getItemRequest) (getItemResponse, error) {
+		return getItemResponse{ID: req.ID, Name: "intercepted"}, nil
+	})
+	MustRegisterNotify(server, "item_changed", func(_ *Context, _ itemChangedNotification) error {
+		return nil
+	})
+	MustRegisterServerStream(server, "stream_items", func(_ *Context, req streamListRequest, stream *StreamWriter[streamItem]) error {
+		return stream.Send(streamItem{Value: req.Prefix + "-0"})
+	})
+
+	client, err := TCPDial(address, "interceptor-test-client", ClientOptions{
+		PingInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	var resp getItemResponse
+	if err := client.Call("get_an_item", getItemRequest{ID: "abc123"}, &resp); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if err := client.Notify("item_changed", itemChangedNotification{ID: "abc123"}); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	reader, err := ServerStream[streamListRequest, streamItem](context.Background(), client, "stream_items", streamListRequest{Prefix: "x", Count: 1})
+	if err != nil {
+		t.Fatalf("server stream: %v", err)
+	}
+	item, err := reader.Recv()
+	if err != nil {
+		t.Fatalf("stream recv: %v", err)
+	}
+	if item.Value != "x-0" {
+		t.Fatalf("stream item = %+v", item)
+	}
+	if _, err := reader.Recv(); !errors.Is(err, io.EOF) {
+		t.Fatalf("stream end err = %v, want io.EOF", err)
+	}
+
+	want := map[string]bool{
+		"unary:get_an_item":   true,
+		"notify:item_changed": true,
+		"stream:stream_items": true,
+	}
+	for i := 0; i < 3; i++ {
+		select {
+		case event := <-events:
+			if !want[event] {
+				t.Fatalf("unexpected interceptor event %q", event)
+			}
+			delete(want, event)
+		case <-time.After(time.Second):
+			t.Fatalf("missing interceptor events: %+v", want)
+		}
+	}
+}
+
+func TestCallSingleflightCollapsesConcurrentCalls(t *testing.T) {
+	server, address, shutdown := startTestServer(t)
+	defer shutdown()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	MustRegister(server, "get_an_item", func(_ *Context, req getItemRequest) (getItemResponse, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return getItemResponse{ID: req.ID, Name: "singleflight"}, nil
+	})
+
+	client, err := TCPDial(address, "singleflight-test-client", ClientOptions{
+		PingInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	var first getItemResponse
+	firstErr := make(chan error, 1)
+	go func() {
+		firstErr <- client.CallSingleflight("get_an_item", "same-key", getItemRequest{ID: "abc123"}, &first)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first singleflight call did not start")
+	}
+
+	var second getItemResponse
+	secondErr := make(chan error, 1)
+	go func() {
+		secondErr <- client.CallSingleflight("get_an_item", "same-key", getItemRequest{ID: "abc123"}, &second)
+	}()
+
+	time.Sleep(25 * time.Millisecond)
+	close(release)
+
+	for name, errCh := range map[string]chan error{
+		"first":  firstErr,
+		"second": secondErr,
+	} {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("%s call: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s call did not finish", name)
+		}
+	}
+	if first.Name != "singleflight" || second.Name != "singleflight" {
+		t.Fatalf("responses = %+v %+v", first, second)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler calls = %d, want 1", got)
+	}
+}
+
+func TestBackpressureRejectsTooManyPendingCalls(t *testing.T) {
+	server, address, shutdown := startTestServer(t)
+	defer shutdown()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	MustRegister(server, "get_an_item", func(_ *Context, req getItemRequest) (getItemResponse, error) {
+		if req.ID == "hold" {
+			close(started)
+			<-release
+		}
+		return getItemResponse{ID: req.ID, Name: "ok"}, nil
+	})
+
+	backpressureEvents := make(chan BackpressureInfo, 1)
+	client, err := TCPDial(address, "backpressure-test-client", ClientOptions{
+		PingInterval: -1,
+		Backpressure: BackpressureOptions{
+			MaxPendingCalls: 1,
+			OnBackpressure: func(info BackpressureInfo) {
+				backpressureEvents <- info
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	firstErr := make(chan error, 1)
+	go func() {
+		var resp getItemResponse
+		firstErr <- client.Call("get_an_item", getItemRequest{ID: "hold"}, &resp)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first call did not start")
+	}
+
+	var resp getItemResponse
+	err = client.Call("get_an_item", getItemRequest{ID: "rejected"}, &resp)
+	if !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("err = %v, want ErrBackpressure", err)
+	}
+
+	select {
+	case event := <-backpressureEvents:
+		if event.Side != BackpressureSideClient || event.Reason != BackpressureReasonPendingCalls {
+			t.Fatalf("backpressure event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("backpressure callback was not called")
+	}
+
+	close(release)
+	select {
+	case err := <-firstErr:
+		if err != nil {
+			t.Fatalf("first call: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first call did not finish")
+	}
+}
+
+func TestServerNotifyAllBroadcastsToConnections(t *testing.T) {
+	server, address, shutdown := startTestServer(t)
+	defer shutdown()
+
+	received := make(chan string, 2)
+	newClient := func(name string) *Client {
+		t.Helper()
+
+		client := NewTCPClient(address, name, ClientOptions{
+			PingInterval: -1,
+		})
+		MustRegisterNotify(client, "item_changed", func(_ *Context, notification itemChangedNotification) error {
+			received <- notification.ID
+			return nil
+		})
+		if err := client.Connect(context.Background()); err != nil {
+			t.Fatalf("connect %s: %v", name, err)
+		}
+
+		return client
+	}
+
+	first := newClient("broadcast-client-1")
+	defer func() {
+		_ = first.Close()
+	}()
+	second := newClient("broadcast-client-2")
+	defer func() {
+		_ = second.Close()
+	}()
+
+	result := server.NotifyAll("item_changed", itemChangedNotification{ID: "broadcast-1"})
+	if !result.OK() || result.Total != 2 || result.Sent != 2 || result.Failed != 0 {
+		t.Fatalf("broadcast result = %+v", result)
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case id := <-received:
+			if id != "broadcast-1" {
+				t.Fatalf("notification id = %q", id)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("broadcast notification was not received")
+		}
 	}
 }
 

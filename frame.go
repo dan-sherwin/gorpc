@@ -18,8 +18,21 @@ var (
 )
 
 func writeFrame(w io.Writer, maxFrameSize int64, codec Codec, frame Frame) error {
+	return writeFrameWithCompression(w, maxFrameSize, codec, nil, frame)
+}
+
+func writeFrameWithCompression(w io.Writer, maxFrameSize int64, codec Codec, compressor Compressor, frame Frame) error {
 	codec = defaultCodec(codec)
 	frame.Version = ProtocolVersion
+
+	if compressor != nil && len(frame.Payload) > 0 {
+		payload, err := compressor.Compress(frame.Payload)
+		if err != nil {
+			return fmt.Errorf("compress frame payload: %w", err)
+		}
+		frame.Payload = payload
+		frame.Compression = compressor.Name()
+	}
 
 	data, err := codec.Marshal(frame)
 	if err != nil {
@@ -47,6 +60,10 @@ func writeFrame(w io.Writer, maxFrameSize int64, codec Codec, frame Frame) error
 }
 
 func readFrame(r io.Reader, maxFrameSize int64, codec Codec) (Frame, error) {
+	return readFrameWithCompression(r, maxFrameSize, codec, nil)
+}
+
+func readFrameWithCompression(r io.Reader, maxFrameSize int64, codec Codec, compressor Compressor) (Frame, error) {
 	codec = defaultCodec(codec)
 	maxFrameSize = normalizeMaxFrameSize(maxFrameSize)
 
@@ -71,6 +88,17 @@ func readFrame(r io.Reader, maxFrameSize int64, codec Codec) (Frame, error) {
 	}
 	if frame.Version != ProtocolVersion {
 		return Frame{}, fmt.Errorf("%w: unsupported version %d", ErrProtocol, frame.Version)
+	}
+	if frame.Compression != "" {
+		if err := ensureCompressor(frame.Compression, compressor); err != nil {
+			return Frame{}, err
+		}
+		payload, err := compressor.Decompress(frame.Payload)
+		if err != nil {
+			return Frame{}, fmt.Errorf("decompress frame payload: %w", err)
+		}
+		frame.Payload = payload
+		frame.Compression = ""
 	}
 
 	return frame, nil

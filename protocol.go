@@ -92,6 +92,7 @@ type Frame struct {
 	RequestID        uint64     `msgpack:"request_id,omitempty"`
 	Function         string     `msgpack:"function,omitempty"`
 	StreamKind       StreamKind `msgpack:"stream_kind,omitempty"`
+	Compression      string     `msgpack:"compression,omitempty"`
 	DeadlineUnixNano int64      `msgpack:"deadline_unix_nano,omitempty"`
 	Payload          []byte     `msgpack:"payload,omitempty"`
 }
@@ -100,12 +101,14 @@ type hello struct {
 	ProtocolVersion uint16 `msgpack:"protocol_version"`
 	Codec           string `msgpack:"codec"`
 	ClientName      string `msgpack:"client_name,omitempty"`
+	Compression     string `msgpack:"compression,omitempty"`
 	AuthMethod      string `msgpack:"auth_method,omitempty"`
 }
 
 type helloAck struct {
 	ProtocolVersion uint16 `msgpack:"protocol_version"`
 	Codec           string `msgpack:"codec"`
+	Compression     string `msgpack:"compression,omitempty"`
 	AuthRequired    bool   `msgpack:"auth_required,omitempty"`
 	AuthMethod      string `msgpack:"auth_method,omitempty"`
 	AuthChallenge   []byte `msgpack:"auth_challenge,omitempty"`

@@ -371,6 +371,17 @@ limit.
 For very large datasets, prefer many smaller stream items over one massive
 item.
 
+## Stream Buffers
+
+Each stream has a receive buffer. The default is 16 frames. Configure the
+process-wide default with `ClientOptions.StreamOptions` or
+`ServerOptions.StreamOptions`, or override a single stream with
+`ServerStreamWithOptions`, `ClientStreamWithOptions`, or
+`BidiStreamWithOptions`.
+
+Larger buffers can smooth bursts, but they do not change `MaxFrameSize` and do
+not make active streams survive reconnect.
+
 ## Errors
 
 Handlers can return `gorpc.NewRemoteError` just like unary handlers:

@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+
+## [v1.0.0-rc.1] - 2026-07-08
+### Added
+- Added optional gzip payload compression negotiated during the handshake.
+- Added optional backpressure limits for pending calls, active streams, and concurrent writes.
+- Added inbound unary, notification, and stream interceptors.
+- Added explicit singleflight unary calls on both `*Client` and `*Conn`.
+- Added server broadcast notifications with `Server.NotifyAll`, `NotifyAllWithTimeout`, and `NotifyAllContext`.
+- Added per-process and per-stream receive buffer options.
+
 ## [v0.5.0] - 2026-07-06
 ### Added
 - Added server streaming, client streaming, and bidirectional streaming with typed helpers and handlers.
@@ -53,6 +64,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Optional `slog` debug logging hooks.
 - CI workflow covering tidy, build, vet, race tests, lint, and govulncheck.
 
+[Unreleased]: https://github.com/dan-sherwin/gorpc/compare/v1.0.0-rc.1...HEAD
+[v1.0.0-rc.1]: https://github.com/dan-sherwin/gorpc/releases/tag/v1.0.0-rc.1
 [v0.5.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.5.0
 [v0.4.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.4.0
 [v0.3.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.3.0
