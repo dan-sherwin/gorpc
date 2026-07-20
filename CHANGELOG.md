@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
+### Added
+- Added `PeerManager`, `PeerClient`, and `PeerStatus` for process-wide, full-duplex peer connection ownership.
+- Added handshake-time duplicate rejection with `ErrPeerConnected` and deterministic simultaneous-dial arbitration.
+- Added managed peer support for unary calls, notifications, and all three streaming shapes.
+
+### Changed
+- Connection lifecycle callbacks now preserve connect-before-disconnect ordering, including short-lived connections.
+- Managed peers cancel redundant dials, stop losing reconnect loops, and retain at most one physical connection per peer pair.
 
 ## [v1.0.0-rc.1] - 2026-07-08
 ### Added

@@ -1058,7 +1058,7 @@ func (c *Client) connectUntilReady(ctx context.Context) error {
 }
 
 func isPermanentInitialConnectError(err error) bool {
-	return errors.Is(err, ErrAuthentication) || errors.Is(err, ErrProtocol)
+	return errors.Is(err, ErrAuthentication) || errors.Is(err, ErrProtocol) || errors.Is(err, ErrPeerConnected)
 }
 
 func (c *Client) reconnectLoop() {
@@ -1212,6 +1212,9 @@ func (c *Client) clientHandshake(conn net.Conn) error {
 	if err != nil {
 		return err
 	}
+	if frame.Type == FrameError {
+		return c.handshakeError(frame)
+	}
 	if frame.Type != FrameHelloAck {
 		return fmt.Errorf("%w: expected hello_ack, got %s", ErrProtocol, frame.Type.String())
 	}
@@ -1283,13 +1286,24 @@ func (c *Client) clientAuth(conn net.Conn, ack helloAck) error {
 		}
 		return nil
 	case FrameError:
-		var remoteErr RemoteError
-		if err := c.codec.Unmarshal(frame.Payload, &remoteErr); err != nil {
-			return fmt.Errorf("%w: decode auth error: %v", ErrAuthentication, err)
-		}
-		return fmt.Errorf("%w: %s", ErrAuthentication, remoteErr.Message)
+		return c.handshakeError(frame)
 	default:
 		return fmt.Errorf("%w: expected auth_ack, got %s", ErrProtocol, frame.Type.String())
+	}
+}
+
+func (c *Client) handshakeError(frame Frame) error {
+	var remoteErr RemoteError
+	if err := c.codec.Unmarshal(frame.Payload, &remoteErr); err != nil {
+		return fmt.Errorf("%w: decode handshake error: %v", ErrProtocol, err)
+	}
+	switch remoteErr.Code {
+	case ErrorCodePeerConnected:
+		return fmt.Errorf("%w: %s", ErrPeerConnected, remoteErr.Message)
+	case ErrorCodeUnauthorized:
+		return fmt.Errorf("%w: %s", ErrAuthentication, remoteErr.Message)
+	default:
+		return fmt.Errorf("%w: %s", ErrUnavailable, remoteErr.Message)
 	}
 }
 

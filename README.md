@@ -34,10 +34,16 @@ This is meant to keep the useful shape of `net/rpc` without inheriting gob as th
 - Optional HMAC-SHA256 shared-secret handshake auth
 - Optional `slog` debug hooks
 - Graceful server shutdown
+- Optional process-wide peer arbitration that enforces one full-duplex connection per peer pair
 
 `Server.ServeTCP`, `Server.ServeUnix`, and `Server.ServeUnixPacket` cover the common listener cases. `Server.ServeListener` accepts any existing `net.Listener`.
 
 The words server and client only describe who accepts the connection and who initiates it. Once connected, both sides can register functions, send requests, receive responses, send one-way notifications, open streams, and handle incoming messages over the same full-duplex connection.
+
+When two applications can both initiate, use one `PeerManager` per process. The
+manager coordinates every listener and dial path, cancels redundant dials, and
+routes calls over whichever authenticated connection was established first.
+See [Peer Arbitration](#peer-arbitration).
 
 `TCPDial`, `UnixDial`, and `UnixPacketDial` establish the first connection, then the returned client keeps monitoring and reconnecting until `Close` is called. Reconnect attempts are intentionally aggressive: quick retry, exponential backoff capped at seconds, jitter, explicit dial timeouts, write deadlines, and ping/pong stale-connection detection. The lower-level `Dial` accepts a context, network, address, and full `ClientOptions` when you need explicit startup control. Use `NewTCPClient`, `NewUnixClient`, or `NewUnixPacketClient` when the dialing side needs to register functions before connecting. `Client.Call`, `Client.CallWithTimeout`, and `Client.CallContext` cover synchronous calls. `Client.AsyncCall` sends the request and invokes a typed callback when the response arrives. `Client.Notify` sends a one-way message and returns after the frame is written locally. Calls made while disconnected wait for the next connection; timeout/context variants bound that wait. Calls and streams already in flight when a connection drops fail with `ErrUnavailable`; GoRPC does not silently replay them because the remote side may already have processed the request or some stream items.
 
@@ -208,6 +214,63 @@ if err := client.Notify("item_changed", ItemChanged{ID: "widget-001"}); err != n
 ```
 
 For server-initiated calls outside an existing request handler, use `ServerOptions.OnConnect` or `server.Connections()` to get a `*gorpc.Conn`, then call `conn.Call`, `conn.CallWithTimeout`, or `conn.AsyncCall`.
+
+## Peer Arbitration
+
+`PeerManager` enforces one active physical connection for each normalized peer
+name. Share the same manager with every GoRPC server and every managed dial path
+in a process.
+
+```go
+peers := gorpc.NewPeerManager("inventory")
+defer peers.Close()
+
+server := gorpc.NewServer(gorpc.ServerOptions{
+	PeerManager: peers,
+})
+gorpc.MustRegister(server, "inventory.lookup", lookup)
+
+peer, err := peers.Dial(ctx, gorpc.PeerDialOptions{
+	PeerName: "warehouse",
+	Network:  "tcp",
+	Address:  "127.0.0.1:9071",
+	ClientOptions: gorpc.ClientOptions{
+		Auth: gorpc.SharedSecret(secret),
+	},
+	RegisterHandlers: func(client *gorpc.Client) error {
+		return gorpc.Register(client, "inventory.lookup", lookup)
+	},
+})
+if err != nil {
+	return err
+}
+defer peer.Close()
+```
+
+The handler is registered on both the listener and the dialing client because
+either physical direction may win. Calls and typed stream helpers accept the
+returned `*PeerClient`; it delegates to the active `*Client` or accepted
+`*Conn`.
+
+Arbitration rules:
+
+- An established connection always wins over later attempts.
+- Establishing an inbound connection cancels redundant in-progress dials.
+- Concurrent callers in one process share one dial and one physical socket.
+- If both applications are already dialing, a stable peer-name tie-breaker
+  chooses one direction so both processes retain the same socket.
+- Rejected duplicates fail the handshake with `ErrPeerConnected`; their
+  reconnect loops are not started.
+- Closing one `PeerClient` releases only that caller's lease. Other users of the
+  peer remain connected.
+- When the winning connection is lost, a peer with an outbound lease resumes
+  dialing. Calls already in flight still fail with `ErrUnavailable` and are not
+  replayed.
+
+Peer arbitration is opt-in so standalone clients and servers keep the existing
+low-level behavior. An application that opts in must attach every listener and
+dial path to the same manager; mixing managed and unmanaged dials can still
+create extra sockets.
 
 ## Operational Options
 

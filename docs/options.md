@@ -5,6 +5,31 @@ connection, no compression, no generated code, no discovery layer, and no hidden
 request replay. The options below are additive knobs for production services
 that need more control.
 
+## Peer Connection Arbitration
+
+Applications where either side may dial should create one `PeerManager` and
+share it with every `Server` and managed dial path in the process.
+
+```go
+peers := gorpc.NewPeerManager("app-a")
+server := gorpc.NewServer(gorpc.ServerOptions{PeerManager: peers})
+
+peer, err := peers.Dial(ctx, gorpc.PeerDialOptions{
+	PeerName: "app-b",
+	Network:  "tcp",
+	Address:  "127.0.0.1:9070",
+})
+```
+
+The first established connection is reused in both directions. New attempts
+are rejected, in-progress redundant dials are canceled, and a deterministic
+tie-breaker resolves simultaneous dials. Register the application's inbound
+handlers on both its `Server` and through `PeerDialOptions.RegisterHandlers`,
+because either side's socket may become the shared connection.
+
+Attach the manager before serving or dialing. A low-level unmanaged `Dial`
+cannot participate in arbitration and may create a second socket.
+
 ## Compression
 
 Compression is negotiated during the handshake. Both peers must configure the

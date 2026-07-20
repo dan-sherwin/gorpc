@@ -27,6 +27,7 @@ type ServerOptions struct {
 	Logger           *slog.Logger
 	OnConnect        func(*Conn)
 	OnDisconnect     func(*Conn)
+	PeerManager      *PeerManager
 
 	Backpressure      BackpressureOptions
 	StreamOptions     StreamOptions
@@ -66,6 +67,7 @@ type Server struct {
 	logger           *slog.Logger
 	onConnect        func(*Conn)
 	onDisconnect     func(*Conn)
+	peerManager      *PeerManager
 
 	backpressure  BackpressureOptions
 	streamOptions StreamOptions
@@ -136,6 +138,7 @@ func NewServer(opts ServerOptions) *Server {
 		logger:               opts.Logger,
 		onConnect:            opts.OnConnect,
 		onDisconnect:         opts.OnDisconnect,
+		peerManager:          opts.PeerManager,
 		backpressure:         backpressure,
 		streamOptions:        normalizeStreamOptions(opts.StreamOptions),
 		unaryInterceptor:     opts.UnaryInterceptor,
@@ -588,21 +591,51 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func (s *Server) serveConn(conn net.Conn) {
 	sc := newConn(s, conn)
-	s.addConn(sc)
-	defer func() {
-		s.removeConn(sc)
-		_ = sc.close()
-	}()
-
-	clientName, compressor, err := s.serverHandshake(conn)
+	clientName, compressor, err := s.serverHandshake(conn, func(clientName string, compressor Compressor) error {
+		sc.clientName = clientName
+		sc.compressor = compressor
+		if s.peerManager != nil {
+			return s.peerManager.acceptInbound(sc)
+		}
+		return nil
+	})
 	if err != nil {
 		s.logDebug("gorpc handshake failed", "error", err)
+		if s.peerManager != nil {
+			s.peerManager.disconnected(sc)
+		}
+		_ = sc.close()
 		return
+	}
+	if s.peerManager != nil {
+		if err := s.peerManager.connected(sc); err != nil {
+			s.logDebug("gorpc peer activation failed", "error", err)
+			s.peerManager.disconnected(sc)
+			_ = sc.close()
+			return
+		}
 	}
 	sc.clientName = clientName
 	sc.compressor = compressor
-	go s.safeOnConnect(sc)
-	defer s.safeOnDisconnect(sc)
+	s.addConn(sc)
+
+	connectionDone := make(chan struct{})
+	lifecycleDone := make(chan struct{})
+	go func() {
+		s.safeOnConnect(sc)
+		<-connectionDone
+		s.safeOnDisconnect(sc)
+		close(lifecycleDone)
+	}()
+	defer func() {
+		close(connectionDone)
+		<-lifecycleDone
+		if s.peerManager != nil {
+			s.peerManager.disconnected(sc)
+		}
+		s.removeConn(sc)
+		_ = sc.close()
+	}()
 
 	for {
 		frame, err := readFrameWithCompression(conn, s.maxFrameSize, s.codec, sc.compressor)
@@ -648,7 +681,7 @@ func (s *Server) serveConn(conn net.Conn) {
 	}
 }
 
-func (s *Server) serverHandshake(conn net.Conn) (string, Compressor, error) {
+func (s *Server) serverHandshake(conn net.Conn, accept func(string, Compressor) error) (string, Compressor, error) {
 	if s.handshakeTimeout > 0 {
 		_ = conn.SetDeadline(time.Now().Add(s.handshakeTimeout))
 		defer func() {
@@ -698,25 +731,46 @@ func (s *Server) serverHandshake(conn net.Conn) (string, Compressor, error) {
 		ack.AuthChallenge = authChallenge
 	}
 
-	payload, err := s.codec.Marshal(ack)
-	if err != nil {
-		return "", nil, fmt.Errorf("encode hello ack: %w", err)
-	}
-
-	if err := writeFrame(conn, s.maxFrameSize, s.codec, Frame{
-		Type:    FrameHelloAck,
-		Payload: payload,
-	}); err != nil {
-		return "", nil, err
-	}
-
 	if s.auth.enabledAuth() {
+		if err := s.writeHelloAck(conn, ack); err != nil {
+			return "", nil, err
+		}
 		if err := s.readAuth(conn, hello, authChallenge); err != nil {
 			return "", nil, err
 		}
+		if accept != nil {
+			if err := accept(hello.ClientName, compressor); err != nil {
+				_ = s.writePeerHandshakeError(conn, err)
+				return "", nil, err
+			}
+		}
+		if err := s.writeAuthAck(conn); err != nil {
+			return "", nil, err
+		}
+		return hello.ClientName, compressor, nil
+	}
+	if accept != nil {
+		if err := accept(hello.ClientName, compressor); err != nil {
+			_ = s.writePeerHandshakeError(conn, err)
+			return "", nil, err
+		}
+	}
+	if err := s.writeHelloAck(conn, ack); err != nil {
+		return "", nil, err
 	}
 
 	return hello.ClientName, compressor, nil
+}
+
+func (s *Server) writeHelloAck(conn net.Conn, ack helloAck) error {
+	payload, err := s.codec.Marshal(ack)
+	if err != nil {
+		return fmt.Errorf("encode hello ack: %w", err)
+	}
+	return writeFrame(conn, s.maxFrameSize, s.codec, Frame{
+		Type:    FrameHelloAck,
+		Payload: payload,
+	})
 }
 
 func (s *Server) readAuth(conn net.Conn, hello hello, challenge []byte) error {
@@ -755,6 +809,10 @@ func (s *Server) readAuth(conn net.Conn, hello hello, challenge []byte) error {
 		return ErrAuthentication
 	}
 
+	return nil
+}
+
+func (s *Server) writeAuthAck(conn net.Conn) error {
 	payload, err := s.codec.Marshal(authAck{OK: true})
 	if err != nil {
 		return fmt.Errorf("encode auth ack: %w", err)
@@ -764,6 +822,17 @@ func (s *Server) readAuth(conn net.Conn, hello hello, challenge []byte) error {
 		Type:    FrameAuthAck,
 		Payload: payload,
 	})
+}
+
+func (s *Server) writePeerHandshakeError(conn net.Conn, err error) error {
+	code := ErrorCodeUnavailable
+	switch {
+	case errors.Is(err, ErrPeerConnected):
+		code = ErrorCodePeerConnected
+	case errors.Is(err, ErrPeerIdentityRequired), errors.Is(err, ErrPeerSelfConnection):
+		code = ErrorCodeUnauthorized
+	}
+	return s.writeHandshakeError(conn, RemoteError{Code: code, Message: err.Error()})
 }
 
 func (s *Server) writeHandshakeError(conn net.Conn, remoteErr RemoteError) error {

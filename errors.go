@@ -16,18 +16,23 @@ const (
 	ErrorCodeUnauthorized     = "unauthorized"
 	ErrorCodeUnavailable      = "unavailable"
 	ErrorCodeBackpressure     = "backpressure"
+	ErrorCodePeerConnected    = "peer_connected"
 )
 
 // Common GoRPC errors.
 var (
-	ErrClosed            = errors.New("gorpc: closed")
-	ErrAuthentication    = errors.New("gorpc: authentication failed")
-	ErrDuplicateFunction = errors.New("gorpc: duplicate function")
-	ErrInvalidFunction   = errors.New("gorpc: invalid function")
-	ErrInvalidHandler    = errors.New("gorpc: invalid handler")
-	ErrInvalidResponse   = errors.New("gorpc: invalid response")
-	ErrUnavailable       = errors.New("gorpc: unavailable")
-	ErrBackpressure      = errors.New("gorpc: backpressure")
+	ErrClosed               = errors.New("gorpc: closed")
+	ErrAuthentication       = errors.New("gorpc: authentication failed")
+	ErrDuplicateFunction    = errors.New("gorpc: duplicate function")
+	ErrInvalidFunction      = errors.New("gorpc: invalid function")
+	ErrInvalidHandler       = errors.New("gorpc: invalid handler")
+	ErrInvalidResponse      = errors.New("gorpc: invalid response")
+	ErrUnavailable          = errors.New("gorpc: unavailable")
+	ErrBackpressure         = errors.New("gorpc: backpressure")
+	ErrPeerConnected        = errors.New("gorpc: peer already connected")
+	ErrPeerConfiguration    = errors.New("gorpc: peer configuration conflict")
+	ErrPeerIdentityRequired = errors.New("gorpc: peer identity is required")
+	ErrPeerSelfConnection   = errors.New("gorpc: peer cannot connect to itself")
 )
 
 // RemoteError is sent in FrameError payloads and returned by callers when the

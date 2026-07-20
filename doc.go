@@ -10,7 +10,9 @@
 // Optional features include HMAC shared-secret authentication, gzip payload
 // compression, inbound interceptors, explicit singleflight calls, server
 // broadcast notifications, and backpressure limits for pending calls, active
-// streams, and concurrent writes.
+// streams, and concurrent writes. PeerManager can coordinate all listeners and
+// dial paths in a process so two full-duplex peers retain one physical
+// connection regardless of which side initiated it.
 //
 // The dialing Client reconnects aggressively after network loss. Calls and
 // streams already in flight fail with ErrUnavailable instead of being replayed,
