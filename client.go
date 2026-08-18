@@ -103,9 +103,10 @@ type Client struct {
 	bidiStreamHandlerMu sync.RWMutex
 	bidiStreamHandlers  map[string]bidiStreamHandler
 
-	connMu sync.Mutex
-	conn   net.Conn
-	ready  chan struct{}
+	connMu               sync.Mutex
+	conn                 net.Conn
+	connectionGeneration uint64
+	ready                chan struct{}
 
 	lastFrameUnixNano atomic.Int64
 
@@ -330,6 +331,22 @@ func (c *Client) CallContext(ctx context.Context, function string, req any, resp
 	return decodeResponse(c.codec, frame, resp)
 }
 
+func (c *Client) callContextOnConnection(ctx context.Context, conn net.Conn, generation uint64, function string, req any, resp any) error {
+	if c == nil {
+		return ErrClosed
+	}
+	if err := validateResponseTarget(resp); err != nil {
+		return err
+	}
+
+	frame, err := c.callFrameContextOnConnection(ctx, conn, generation, function, req)
+	if err != nil {
+		return err
+	}
+
+	return decodeResponse(c.codec, frame, resp)
+}
+
 // CallSingleflight performs a unary request/response call and collapses
 // concurrent calls with the same function and key into one remote request.
 func (c *Client) CallSingleflight(function string, key string, req any, resp any) error {
@@ -410,6 +427,36 @@ func (c *Client) callFrameContext(ctx context.Context, function string, req any)
 	}
 }
 
+func (c *Client) callFrameContextOnConnection(ctx context.Context, conn net.Conn, generation uint64, function string, req any) (Frame, error) {
+	if c == nil {
+		return Frame{}, ErrClosed
+	}
+	ctx = normalizeContext(ctx)
+
+	responseCh := make(chan clientResponse, 1)
+	requestID, err := c.sendRequestToConnection(ctx, conn, generation, function, req, syncPendingCall{ch: responseCh})
+	if err != nil {
+		return Frame{}, err
+	}
+
+	select {
+	case response := <-responseCh:
+		if response.err != nil {
+			return Frame{}, response.err
+		}
+		return response.frame, nil
+	case <-ctx.Done():
+		c.removePending(requestID)
+		if err := c.writeToGeneration(conn, generation, Frame{Type: FrameCancel, RequestID: requestID}); err != nil {
+			c.handleWriteErrorGeneration(conn, generation, err)
+		}
+		return Frame{}, ctx.Err()
+	case <-c.closed:
+		c.removePending(requestID)
+		return Frame{}, c.closedError()
+	}
+}
+
 // AsyncCall sends a unary request and invokes handler when the response arrives.
 func (c *Client) AsyncCall(function string, req any, handler any, correlationID string) error {
 	return c.AsyncCallContext(context.Background(), function, req, handler, correlationID)
@@ -469,6 +516,11 @@ func (c *Client) NotifyWithTimeout(function string, req any, timeout time.Durati
 // errors.
 func (c *Client) NotifyContext(ctx context.Context, function string, req any) error {
 	_, err := c.sendNotify(ctx, function, req)
+	return err
+}
+
+func (c *Client) notifyContextOnConnection(ctx context.Context, conn net.Conn, generation uint64, function string, req any) error {
+	_, err := c.sendNotifyToConnection(ctx, conn, generation, function, req)
 	return err
 }
 
@@ -556,6 +608,47 @@ func (c *Client) sendRequest(ctx context.Context, function string, req any, pend
 	return requestID, nil
 }
 
+func (c *Client) sendRequestToConnection(ctx context.Context, conn net.Conn, generation uint64, function string, req any, pending pendingCall) (uint64, error) {
+	ctx = normalizeContext(ctx)
+	if c == nil {
+		return 0, ErrClosed
+	}
+	if function == "" {
+		return 0, ErrInvalidFunction
+	}
+	if generation == 0 || conn == nil || !c.isCurrentConnGeneration(conn, generation) {
+		return 0, ErrUnavailable
+	}
+
+	payload, err := c.codec.Marshal(req)
+	if err != nil {
+		return 0, fmt.Errorf("encode request: %w", err)
+	}
+
+	requestID := c.nextRequestID()
+	if err := c.addPending(requestID, pending); err != nil {
+		return 0, err
+	}
+
+	frame := Frame{
+		Type:      FrameRequest,
+		RequestID: requestID,
+		Function:  function,
+		Payload:   payload,
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		frame.DeadlineUnixNano = deadline.UnixNano()
+	}
+
+	if err := c.writeToGeneration(conn, generation, frame); err != nil {
+		c.removePending(requestID)
+		c.handleWriteErrorGeneration(conn, generation, err)
+		return 0, err
+	}
+
+	return requestID, nil
+}
+
 func (c *Client) sendNotify(ctx context.Context, function string, req any) (uint64, error) {
 	ctx = normalizeContext(ctx)
 	if c == nil {
@@ -588,6 +681,42 @@ func (c *Client) sendNotify(ctx context.Context, function string, req any) (uint
 
 	if err := c.writeTo(conn, frame); err != nil {
 		c.handleWriteError(conn, err)
+		return 0, err
+	}
+
+	return requestID, nil
+}
+
+func (c *Client) sendNotifyToConnection(ctx context.Context, conn net.Conn, generation uint64, function string, req any) (uint64, error) {
+	ctx = normalizeContext(ctx)
+	if c == nil {
+		return 0, ErrClosed
+	}
+	if function == "" {
+		return 0, ErrInvalidFunction
+	}
+	if generation == 0 || conn == nil || !c.isCurrentConnGeneration(conn, generation) {
+		return 0, ErrUnavailable
+	}
+
+	payload, err := c.codec.Marshal(req)
+	if err != nil {
+		return 0, fmt.Errorf("encode notification: %w", err)
+	}
+
+	requestID := c.nextRequestID()
+	frame := Frame{
+		Type:      FrameNotify,
+		RequestID: requestID,
+		Function:  function,
+		Payload:   payload,
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		frame.DeadlineUnixNano = deadline.UnixNano()
+	}
+
+	if err := c.writeToGeneration(conn, generation, frame); err != nil {
+		c.handleWriteErrorGeneration(conn, generation, err)
 		return 0, err
 	}
 
@@ -1111,10 +1240,11 @@ func (c *Client) connectOnce(ctx context.Context) error {
 		return err
 	}
 
-	c.setConn(conn)
+	connectionGeneration := nextConnectionGeneration()
+	c.setConn(conn, connectionGeneration)
 	c.logDebug("gorpc connected", "network", c.network, "address", c.address)
 
-	go c.readLoop(conn)
+	go c.readLoop(conn, connectionGeneration)
 	if c.pingInterval > 0 && c.pingTimeout > 0 {
 		go c.pingLoop(conn)
 	}
@@ -1122,7 +1252,7 @@ func (c *Client) connectOnce(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) setConn(conn net.Conn) {
+func (c *Client) setConn(conn net.Conn, connectionGeneration uint64) {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 
@@ -1131,6 +1261,7 @@ func (c *Client) setConn(conn net.Conn) {
 	}
 
 	c.conn = conn
+	c.connectionGeneration = connectionGeneration
 	c.lastFrameUnixNano.Store(time.Now().UnixNano())
 	close(c.ready)
 }
@@ -1161,21 +1292,30 @@ func (c *Client) waitConn(ctx context.Context) (net.Conn, error) {
 }
 
 func (c *Client) currentConn() (net.Conn, bool) {
+	conn, _, ok := c.currentConnWithGeneration()
+	return conn, ok
+}
+
+func (c *Client) currentConnWithGeneration() (net.Conn, uint64, bool) {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 
 	if c.conn == nil {
-		return nil, false
+		return nil, 0, false
 	}
 
-	return c.conn, true
+	return c.conn, c.connectionGeneration, true
 }
 
 func (c *Client) isCurrentConn(conn net.Conn) bool {
+	return c.isCurrentConnGeneration(conn, 0)
+}
+
+func (c *Client) isCurrentConnGeneration(conn net.Conn, generation uint64) bool {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 
-	return c.conn == conn
+	return c.conn == conn && (generation == 0 || c.connectionGeneration == generation)
 }
 
 func (c *Client) nextRequestID() uint64 {
@@ -1307,7 +1447,7 @@ func (c *Client) handshakeError(frame Frame) error {
 	}
 }
 
-func (c *Client) readLoop(conn net.Conn) {
+func (c *Client) readLoop(conn net.Conn, connectionGeneration uint64) {
 	for {
 		frame, err := readFrameWithCompression(conn, c.maxFrameSize, c.codec, c.compressor)
 		if err != nil {
@@ -1324,11 +1464,11 @@ func (c *Client) readLoop(conn net.Conn) {
 
 		switch frame.Type {
 		case FrameRequest:
-			c.startRequest(conn, frame)
+			c.startRequest(conn, connectionGeneration, frame)
 		case FrameNotify:
-			c.startNotify(conn, frame)
+			c.startNotify(conn, connectionGeneration, frame)
 		case FrameStreamStart:
-			c.startStream(conn, frame)
+			c.startStream(conn, connectionGeneration, frame)
 		case FrameStreamItem, FrameStreamEnd:
 			if !c.deliverStreamFrame(frame) {
 				c.logDebug("gorpc discarded stream frame for unknown request", "type", frame.Type.String(), "request_id", frame.RequestID)
@@ -1357,7 +1497,7 @@ func (c *Client) readLoop(conn net.Conn) {
 	}
 }
 
-func (c *Client) startRequest(conn net.Conn, frame Frame) {
+func (c *Client) startRequest(conn net.Conn, connectionGeneration uint64, frame Frame) {
 	if frame.RequestID == 0 {
 		_ = c.writeErrorTo(conn, frame, RemoteError{
 			Code:    ErrorCodeInvalidRequest,
@@ -1392,11 +1532,12 @@ func (c *Client) startRequest(conn net.Conn, frame Frame) {
 	}
 
 	rpcCtx := &Context{
-		Context:    ctx,
-		requestID:  frame.RequestID,
-		function:   frame.Function,
-		remoteAddr: conn.RemoteAddr(),
-		localAddr:  conn.LocalAddr(),
+		Context:              ctx,
+		requestID:            frame.RequestID,
+		function:             frame.Function,
+		remoteAddr:           conn.RemoteAddr(),
+		localAddr:            conn.LocalAddr(),
+		connectionGeneration: connectionGeneration,
 	}
 
 	c.requestMu.Lock()
@@ -1434,7 +1575,7 @@ func (c *Client) startRequest(conn net.Conn, frame Frame) {
 	}()
 }
 
-func (c *Client) startNotify(conn net.Conn, frame Frame) {
+func (c *Client) startNotify(conn net.Conn, connectionGeneration uint64, frame Frame) {
 	if frame.RequestID == 0 {
 		c.logDebug("gorpc discarded notification without request_id", "function", frame.Function)
 		return
@@ -1460,12 +1601,13 @@ func (c *Client) startNotify(conn net.Conn, frame Frame) {
 	}
 
 	rpcCtx := &Context{
-		Context:    ctx,
-		requestID:  frame.RequestID,
-		function:   frame.Function,
-		remoteAddr: conn.RemoteAddr(),
-		localAddr:  conn.LocalAddr(),
-		notify:     true,
+		Context:              ctx,
+		requestID:            frame.RequestID,
+		function:             frame.Function,
+		remoteAddr:           conn.RemoteAddr(),
+		localAddr:            conn.LocalAddr(),
+		connectionGeneration: connectionGeneration,
+		notify:               true,
 	}
 
 	c.requestMu.Lock()
@@ -1489,7 +1631,7 @@ func (c *Client) startNotify(conn net.Conn, frame Frame) {
 	}()
 }
 
-func (c *Client) startStream(conn net.Conn, frame Frame) {
+func (c *Client) startStream(conn net.Conn, connectionGeneration uint64, frame Frame) {
 	if frame.RequestID == 0 {
 		_ = c.writeErrorTo(conn, frame, RemoteError{
 			Code:    ErrorCodeInvalidRequest,
@@ -1507,11 +1649,11 @@ func (c *Client) startStream(conn net.Conn, frame Frame) {
 
 	switch frame.StreamKind {
 	case StreamKindServer:
-		c.startServerStream(conn, frame)
+		c.startServerStream(conn, connectionGeneration, frame)
 	case StreamKindClient:
-		c.startClientStream(conn, frame)
+		c.startClientStream(conn, connectionGeneration, frame)
 	case StreamKindBidi:
-		c.startBidiStream(conn, frame)
+		c.startBidiStream(conn, connectionGeneration, frame)
 	default:
 		_ = c.writeErrorTo(conn, frame, RemoteError{
 			Code:    ErrorCodeInvalidRequest,
@@ -1520,7 +1662,7 @@ func (c *Client) startStream(conn net.Conn, frame Frame) {
 	}
 }
 
-func (c *Client) startServerStream(conn net.Conn, frame Frame) {
+func (c *Client) startServerStream(conn net.Conn, connectionGeneration uint64, frame Frame) {
 	h := c.findServerStreamHandler(frame.Function)
 	if h == nil {
 		_ = c.writeErrorTo(conn, frame, RemoteError{
@@ -1532,13 +1674,14 @@ func (c *Client) startServerStream(conn net.Conn, frame Frame) {
 
 	ctx, cancel := contextFromFrame(frame)
 	rpcCtx := &Context{
-		Context:    ctx,
-		requestID:  frame.RequestID,
-		function:   frame.Function,
-		remoteAddr: conn.RemoteAddr(),
-		localAddr:  conn.LocalAddr(),
-		stream:     true,
-		streamKind: StreamKindServer,
+		Context:              ctx,
+		requestID:            frame.RequestID,
+		function:             frame.Function,
+		remoteAddr:           conn.RemoteAddr(),
+		localAddr:            conn.LocalAddr(),
+		connectionGeneration: connectionGeneration,
+		stream:               true,
+		streamKind:           StreamKindServer,
 	}
 	stream := newStreamWithOptions(ctx, frame.RequestID, frame.Function, c.codec, func(writeFrame Frame) error {
 		if err := c.writeTo(conn, writeFrame); err != nil {
@@ -1584,7 +1727,7 @@ func (c *Client) startServerStream(conn net.Conn, frame Frame) {
 	}()
 }
 
-func (c *Client) startClientStream(conn net.Conn, frame Frame) {
+func (c *Client) startClientStream(conn net.Conn, connectionGeneration uint64, frame Frame) {
 	h := c.findClientStreamHandler(frame.Function)
 	if h == nil {
 		_ = c.writeErrorTo(conn, frame, RemoteError{
@@ -1596,13 +1739,14 @@ func (c *Client) startClientStream(conn net.Conn, frame Frame) {
 
 	ctx, cancel := contextFromFrame(frame)
 	rpcCtx := &Context{
-		Context:    ctx,
-		requestID:  frame.RequestID,
-		function:   frame.Function,
-		remoteAddr: conn.RemoteAddr(),
-		localAddr:  conn.LocalAddr(),
-		stream:     true,
-		streamKind: StreamKindClient,
+		Context:              ctx,
+		requestID:            frame.RequestID,
+		function:             frame.Function,
+		remoteAddr:           conn.RemoteAddr(),
+		localAddr:            conn.LocalAddr(),
+		connectionGeneration: connectionGeneration,
+		stream:               true,
+		streamKind:           StreamKindClient,
 	}
 	stream := newStreamWithOptions(ctx, frame.RequestID, frame.Function, c.codec, func(writeFrame Frame) error {
 		if err := c.writeTo(conn, writeFrame); err != nil {
@@ -1654,7 +1798,7 @@ func (c *Client) startClientStream(conn net.Conn, frame Frame) {
 	}()
 }
 
-func (c *Client) startBidiStream(conn net.Conn, frame Frame) {
+func (c *Client) startBidiStream(conn net.Conn, connectionGeneration uint64, frame Frame) {
 	h := c.findBidiStreamHandler(frame.Function)
 	if h == nil {
 		_ = c.writeErrorTo(conn, frame, RemoteError{
@@ -1666,13 +1810,14 @@ func (c *Client) startBidiStream(conn net.Conn, frame Frame) {
 
 	ctx, cancel := contextFromFrame(frame)
 	rpcCtx := &Context{
-		Context:    ctx,
-		requestID:  frame.RequestID,
-		function:   frame.Function,
-		remoteAddr: conn.RemoteAddr(),
-		localAddr:  conn.LocalAddr(),
-		stream:     true,
-		streamKind: StreamKindBidi,
+		Context:              ctx,
+		requestID:            frame.RequestID,
+		function:             frame.Function,
+		remoteAddr:           conn.RemoteAddr(),
+		localAddr:            conn.LocalAddr(),
+		connectionGeneration: connectionGeneration,
+		stream:               true,
+		streamKind:           StreamKindBidi,
 	}
 	stream := newStreamWithOptions(ctx, frame.RequestID, frame.Function, c.codec, func(writeFrame Frame) error {
 		if err := c.writeTo(conn, writeFrame); err != nil {
@@ -1790,6 +1935,10 @@ func (c *Client) pingLoop(conn net.Conn) {
 }
 
 func (c *Client) connectionLost(conn net.Conn, err error) {
+	c.connectionLostGeneration(conn, 0, err)
+}
+
+func (c *Client) connectionLostGeneration(conn net.Conn, generation uint64, err error) {
 	if err == nil {
 		err = ErrUnavailable
 	}
@@ -1798,11 +1947,12 @@ func (c *Client) connectionLost(conn net.Conn, err error) {
 	}
 
 	c.connMu.Lock()
-	if c.conn != conn {
+	if c.conn != conn || (generation != 0 && c.connectionGeneration != generation) {
 		c.connMu.Unlock()
 		return
 	}
 	c.conn = nil
+	c.connectionGeneration = 0
 	c.ready = make(chan struct{})
 	c.connMu.Unlock()
 
@@ -2017,13 +2167,24 @@ func (c *Client) invokeAsyncHandler(requestID uint64, pending asyncPendingCall, 
 }
 
 func (c *Client) writeTo(conn net.Conn, frame Frame) error {
+	return c.writeToConnection(conn, 0, frame)
+}
+
+func (c *Client) writeToGeneration(conn net.Conn, generation uint64, frame Frame) error {
+	if generation == 0 {
+		return ErrUnavailable
+	}
+	return c.writeToConnection(conn, generation, frame)
+}
+
+func (c *Client) writeToConnection(conn net.Conn, generation uint64, frame Frame) error {
 	select {
 	case <-c.closed:
 		return c.closedError()
 	default:
 	}
 
-	if !c.isCurrentConn(conn) {
+	if !c.isCurrentConnGeneration(conn, generation) {
 		return ErrUnavailable
 	}
 	if !c.writeLimiter.acquire() {
@@ -2042,7 +2203,7 @@ func (c *Client) writeTo(conn net.Conn, frame Frame) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	if !c.isCurrentConn(conn) {
+	if !c.isCurrentConnGeneration(conn, generation) {
 		return ErrUnavailable
 	}
 
@@ -2059,11 +2220,15 @@ func (c *Client) writeTo(conn net.Conn, frame Frame) error {
 }
 
 func (c *Client) handleWriteError(conn net.Conn, err error) {
+	c.handleWriteErrorGeneration(conn, 0, err)
+}
+
+func (c *Client) handleWriteErrorGeneration(conn net.Conn, generation uint64, err error) {
 	if err == nil || errors.Is(err, ErrBackpressure) {
 		return
 	}
 
-	c.connectionLost(conn, err)
+	c.connectionLostGeneration(conn, generation, err)
 }
 
 func (c *Client) reportBackpressure(info BackpressureInfo) {
@@ -2087,6 +2252,7 @@ func (c *Client) closeWithError(err error) {
 			_ = c.conn.Close()
 			c.conn = nil
 		}
+		c.connectionGeneration = 0
 		select {
 		case <-c.ready:
 		default:

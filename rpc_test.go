@@ -198,6 +198,72 @@ func TestNotifyServerToClientOnConnect(t *testing.T) {
 	}
 }
 
+func TestConnDoneTracksPhysicalConnectionLifecycle(t *testing.T) {
+	var nilConn *Conn
+	if nilConn.Done() != nil {
+		t.Fatal("nil Conn Done channel was non-nil")
+	}
+
+	for _, test := range []struct {
+		name       string
+		disconnect func(*Conn, *Client) error
+	}{
+		{
+			name: "accepted connection close",
+			disconnect: func(conn *Conn, _ *Client) error {
+				return conn.Close()
+			},
+		},
+		{
+			name: "remote client disconnect",
+			disconnect: func(_ *Conn, client *Client) error {
+				return client.Close()
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			connected := make(chan *Conn, 1)
+			_, address, shutdown := startTestServerWithOptions(t, ServerOptions{
+				OnConnect: func(conn *Conn) {
+					connected <- conn
+				},
+			})
+			defer shutdown()
+
+			client, err := Dial(context.Background(), "tcp", address, ClientOptions{
+				PingInterval: -1,
+			})
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer func() { _ = client.Close() }()
+
+			var conn *Conn
+			select {
+			case conn = <-connected:
+			case <-time.After(time.Second):
+				t.Fatal("server did not report accepted connection")
+			}
+
+			select {
+			case <-conn.Done():
+				t.Fatal("Conn Done channel closed while connection was active")
+			default:
+			}
+
+			if err := test.disconnect(conn, client); err != nil {
+				t.Fatalf("disconnect: %v", err)
+			}
+
+			select {
+			case <-conn.Done():
+			case <-time.After(time.Second):
+				t.Fatal("Conn Done channel did not close after physical disconnect")
+			}
+		})
+	}
+}
+
 func TestBidirectionalRequestFromServerHandler(t *testing.T) {
 	server, address, shutdown := startTestServer(t)
 	defer shutdown()

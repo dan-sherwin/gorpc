@@ -16,7 +16,7 @@ type PeerDirection string
 
 const (
 	// PeerDirectionInbound means the remote peer established the physical connection.
-	PeerDirectionInbound  PeerDirection = "inbound"
+	PeerDirectionInbound PeerDirection = "inbound"
 	// PeerDirectionOutbound means the local peer established the physical connection.
 	PeerDirectionOutbound PeerDirection = "outbound"
 )
@@ -53,8 +53,11 @@ type PeerStatus struct {
 	LocalAddress  string
 	RemoteAddress string
 	ConnectedAt   time.Time
-	Dialing       bool
-	LastError     string
+	// ConnectionGeneration is the opaque, nonzero process-local identity of
+	// the current physical connection. It changes after an automatic reconnect.
+	ConnectionGeneration uint64
+	Dialing              bool
+	LastError            string
 }
 
 type peerDialConfig struct {
@@ -104,6 +107,16 @@ type Peer struct {
 type PeerClient struct {
 	peer   *Peer
 	closed atomic.Bool
+}
+
+// PeerEndpoint is a callback endpoint bound to one exact physical connection.
+// It never waits for or switches to a replacement connection after reconnect.
+// Obtain one with Peer.EndpointForGeneration.
+type PeerEndpoint struct {
+	connectionGeneration uint64
+	client               *Client
+	clientConn           net.Conn
+	conn                 *Conn
 }
 
 // NewPeerManager creates a connection manager for localName.
@@ -536,20 +549,181 @@ func (p *Peer) Status() PeerStatus {
 	switch p.active.direction {
 	case PeerDirectionInbound:
 		status.Active = p.active.ready
+		status.ConnectionGeneration = p.active.conn.ConnectionGeneration()
 		status.LocalAddress = addrString(p.active.conn.LocalAddr())
 		status.RemoteAddress = addrString(p.active.conn.RemoteAddr())
 		if p.active.conn.LocalAddr() != nil {
 			status.Network = p.active.conn.LocalAddr().Network()
 		}
 	case PeerDirectionOutbound:
-		status.Active = clientReady(p.active.client)
-		if conn, ok := p.active.client.currentConn(); ok {
+		if p.active.client == nil {
+			break
+		}
+		conn, generation, active := p.active.client.currentConnWithGeneration()
+		status.Active = active
+		if active {
+			status.ConnectionGeneration = generation
 			status.LocalAddress = addrString(conn.LocalAddr())
 			status.RemoteAddress = addrString(conn.RemoteAddr())
 			status.Network = conn.RemoteAddr().Network()
 		}
 	}
 	return status
+}
+
+// EndpointForGeneration returns a callback endpoint only when generation
+// identifies the peer's exact current physical connection. The returned
+// endpoint remains bound to that connection; after reconnect, its calls fail
+// with ErrUnavailable instead of waiting for or switching to the replacement.
+func (p *Peer) EndpointForGeneration(generation uint64) (*PeerEndpoint, bool) {
+	if p == nil || generation == 0 {
+		return nil, false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.active == nil || !p.active.ready {
+		return nil, false
+	}
+
+	switch p.active.direction {
+	case PeerDirectionInbound:
+		conn := p.active.conn
+		if conn == nil || conn.ConnectionGeneration() != generation {
+			return nil, false
+		}
+		select {
+		case <-conn.Done():
+			return nil, false
+		default:
+		}
+		return &PeerEndpoint{
+			connectionGeneration: generation,
+			conn:                 conn,
+		}, true
+	case PeerDirectionOutbound:
+		client := p.active.client
+		if client == nil {
+			return nil, false
+		}
+		conn, currentGeneration, active := client.currentConnWithGeneration()
+		if !active || currentGeneration != generation {
+			return nil, false
+		}
+		return &PeerEndpoint{
+			connectionGeneration: generation,
+			client:               client,
+			clientConn:           conn,
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+// ConnectionGeneration returns the physical connection generation captured by
+// this endpoint. It returns zero for a nil endpoint.
+func (e *PeerEndpoint) ConnectionGeneration() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.connectionGeneration
+}
+
+// Call invokes a unary function on the endpoint's bound physical connection.
+func (e *PeerEndpoint) Call(function string, req any, resp any) error {
+	return e.CallContext(context.Background(), function, req, resp)
+}
+
+// CallWithTimeout invokes a unary function on the endpoint's bound physical
+// connection with a timeout.
+func (e *PeerEndpoint) CallWithTimeout(function string, req any, resp any, timeout time.Duration) error {
+	if timeout <= 0 {
+		return e.Call(function, req, resp)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return e.CallContext(ctx, function, req, resp)
+}
+
+// CallContext invokes a unary function on the endpoint's bound physical
+// connection. It returns ErrUnavailable when that connection is no longer
+// current and never waits for a replacement connection.
+func (e *PeerEndpoint) CallContext(ctx context.Context, function string, req any, resp any) error {
+	if e == nil || e.connectionGeneration == 0 {
+		return ErrClosed
+	}
+	if e.conn != nil {
+		if e.conn.ConnectionGeneration() != e.connectionGeneration {
+			return ErrUnavailable
+		}
+		select {
+		case <-e.conn.Done():
+			return ErrUnavailable
+		default:
+		}
+		err := e.conn.CallContext(ctx, function, req, resp)
+		if errors.Is(err, ErrClosed) {
+			return ErrUnavailable
+		}
+		return err
+	}
+	if e.client == nil || e.clientConn == nil {
+		return ErrClosed
+	}
+	err := e.client.callContextOnConnection(ctx, e.clientConn, e.connectionGeneration, function, req, resp)
+	if errors.Is(err, ErrClosed) {
+		return ErrUnavailable
+	}
+	return err
+}
+
+// Notify sends a one-way notification on the endpoint's bound physical
+// connection.
+func (e *PeerEndpoint) Notify(function string, req any) error {
+	return e.NotifyContext(context.Background(), function, req)
+}
+
+// NotifyWithTimeout sends a one-way notification on the endpoint's bound
+// physical connection with a timeout.
+func (e *PeerEndpoint) NotifyWithTimeout(function string, req any, timeout time.Duration) error {
+	if timeout <= 0 {
+		return e.Notify(function, req)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return e.NotifyContext(ctx, function, req)
+}
+
+// NotifyContext sends a one-way notification on the endpoint's bound physical
+// connection. It returns ErrUnavailable when that connection is no longer
+// current and never waits for a replacement connection.
+func (e *PeerEndpoint) NotifyContext(ctx context.Context, function string, req any) error {
+	if e == nil || e.connectionGeneration == 0 {
+		return ErrClosed
+	}
+	if e.conn != nil {
+		if e.conn.ConnectionGeneration() != e.connectionGeneration {
+			return ErrUnavailable
+		}
+		select {
+		case <-e.conn.Done():
+			return ErrUnavailable
+		default:
+		}
+		err := e.conn.NotifyContext(ctx, function, req)
+		if errors.Is(err, ErrClosed) {
+			return ErrUnavailable
+		}
+		return err
+	}
+	if e.client == nil || e.clientConn == nil {
+		return ErrClosed
+	}
+	err := e.client.notifyContextOnConnection(ctx, e.clientConn, e.connectionGeneration, function, req)
+	if errors.Is(err, ErrClosed) {
+		return ErrUnavailable
+	}
+	return err
 }
 
 // WaitReady waits until the peer has one active physical connection.

@@ -267,6 +267,21 @@ Arbitration rules:
   dialing. Calls already in flight still fail with `ErrUnavailable` and are not
   replayed.
 
+`Context.ConnectionGeneration()`, `Conn.ConnectionGeneration()`, and
+`PeerStatus.ConnectionGeneration` expose the same opaque, nonzero,
+process-local generation for one physical connection. A dialing client's
+generation changes after every successful automatic reconnect even though its
+logical `Client` and `Peer` remain the same. The value is local lifecycle
+identity, not a wire identifier or authentication credential; applications can
+use it to bind connection-scoped authorization established by an RPC handshake.
+
+For a connection-authorized callback, resolve the logical peer with
+`Peer.EndpointForGeneration`. It returns a `PeerEndpoint` only when the supplied
+generation is still the peer's exact current physical connection. The endpoint
+captures that connection: `CallContext`, `CallWithTimeout`, and `NotifyContext`
+return `ErrUnavailable` after it disconnects and never wait for or switch to an
+automatically reconnected socket.
+
 Peer arbitration is opt-in so standalone clients and servers keep the existing
 low-level behavior. An application that opts in must attach every listener and
 dial path to the same manager; mixing managed and unmanaged dials can still

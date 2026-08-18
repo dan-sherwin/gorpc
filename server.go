@@ -970,10 +970,11 @@ func (s *Server) logDebug(msg string, args ...any) {
 // server-registered functions and can also initiate requests back to the client
 // over the same full-duplex connection.
 type Conn struct {
-	server     *Server
-	conn       net.Conn
-	clientName string
-	compressor Compressor
+	server               *Server
+	conn                 net.Conn
+	clientName           string
+	compressor           Compressor
+	connectionGeneration uint64
 
 	nextID       atomic.Uint64
 	writeMu      sync.Mutex
@@ -998,13 +999,14 @@ type Conn struct {
 
 func newConn(server *Server, conn net.Conn) *Conn {
 	return &Conn{
-		server:       server,
-		conn:         conn,
-		writeLimiter: newWriteLimiter(server.backpressure.MaxConcurrentWrites),
-		pending:      make(map[uint64]pendingCall),
-		requests:     make(map[uint64]context.CancelFunc),
-		streams:      make(map[uint64]*Stream),
-		closed:       make(chan struct{}),
+		server:               server,
+		conn:                 conn,
+		connectionGeneration: nextConnectionGeneration(),
+		writeLimiter:         newWriteLimiter(server.backpressure.MaxConcurrentWrites),
+		pending:              make(map[uint64]pendingCall),
+		requests:             make(map[uint64]context.CancelFunc),
+		streams:              make(map[uint64]*Stream),
+		closed:               make(chan struct{}),
 	}
 }
 
@@ -1034,6 +1036,28 @@ func (c *Conn) LocalAddr() net.Addr {
 	}
 
 	return c.conn.LocalAddr()
+}
+
+// ConnectionGeneration returns the opaque, process-local generation assigned
+// to this physical accepted connection. The value is nonzero and is never
+// reused by another live connection in the process.
+func (c *Conn) ConnectionGeneration() uint64 {
+	if c == nil {
+		return 0
+	}
+
+	return c.connectionGeneration
+}
+
+// Done returns a channel that is closed when this physical accepted connection
+// closes. It remains open for the lifetime of the active connection. Done
+// returns nil when called on a nil Conn.
+func (c *Conn) Done() <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+
+	return c.closed
 }
 
 // Call performs a unary request/response call to the connected client.
@@ -1458,13 +1482,14 @@ func (c *Conn) startRequest(frame Frame) {
 	}
 
 	rpcCtx := &Context{
-		Context:    ctx,
-		clientName: c.clientName,
-		requestID:  frame.RequestID,
-		function:   frame.Function,
-		remoteAddr: c.conn.RemoteAddr(),
-		localAddr:  c.conn.LocalAddr(),
-		conn:       c,
+		Context:              ctx,
+		clientName:           c.clientName,
+		requestID:            frame.RequestID,
+		function:             frame.Function,
+		remoteAddr:           c.conn.RemoteAddr(),
+		localAddr:            c.conn.LocalAddr(),
+		conn:                 c,
+		connectionGeneration: c.connectionGeneration,
 	}
 
 	c.requestMu.Lock()
@@ -1528,14 +1553,15 @@ func (c *Conn) startNotify(frame Frame) {
 	}
 
 	rpcCtx := &Context{
-		Context:    ctx,
-		clientName: c.clientName,
-		requestID:  frame.RequestID,
-		function:   frame.Function,
-		remoteAddr: c.conn.RemoteAddr(),
-		localAddr:  c.conn.LocalAddr(),
-		conn:       c,
-		notify:     true,
+		Context:              ctx,
+		clientName:           c.clientName,
+		requestID:            frame.RequestID,
+		function:             frame.Function,
+		remoteAddr:           c.conn.RemoteAddr(),
+		localAddr:            c.conn.LocalAddr(),
+		conn:                 c,
+		connectionGeneration: c.connectionGeneration,
+		notify:               true,
 	}
 
 	c.requestMu.Lock()
@@ -1602,15 +1628,16 @@ func (c *Conn) startServerStream(frame Frame) {
 
 	ctx, cancel := contextFromFrame(frame)
 	rpcCtx := &Context{
-		Context:    ctx,
-		clientName: c.clientName,
-		requestID:  frame.RequestID,
-		function:   frame.Function,
-		remoteAddr: c.conn.RemoteAddr(),
-		localAddr:  c.conn.LocalAddr(),
-		conn:       c,
-		stream:     true,
-		streamKind: StreamKindServer,
+		Context:              ctx,
+		clientName:           c.clientName,
+		requestID:            frame.RequestID,
+		function:             frame.Function,
+		remoteAddr:           c.conn.RemoteAddr(),
+		localAddr:            c.conn.LocalAddr(),
+		conn:                 c,
+		connectionGeneration: c.connectionGeneration,
+		stream:               true,
+		streamKind:           StreamKindServer,
 	}
 	stream := newStreamWithOptions(ctx, frame.RequestID, frame.Function, c.server.codec, func(writeFrame Frame) error {
 		if err := c.write(writeFrame); err != nil {
@@ -1668,15 +1695,16 @@ func (c *Conn) startClientStream(frame Frame) {
 
 	ctx, cancel := contextFromFrame(frame)
 	rpcCtx := &Context{
-		Context:    ctx,
-		clientName: c.clientName,
-		requestID:  frame.RequestID,
-		function:   frame.Function,
-		remoteAddr: c.conn.RemoteAddr(),
-		localAddr:  c.conn.LocalAddr(),
-		conn:       c,
-		stream:     true,
-		streamKind: StreamKindClient,
+		Context:              ctx,
+		clientName:           c.clientName,
+		requestID:            frame.RequestID,
+		function:             frame.Function,
+		remoteAddr:           c.conn.RemoteAddr(),
+		localAddr:            c.conn.LocalAddr(),
+		conn:                 c,
+		connectionGeneration: c.connectionGeneration,
+		stream:               true,
+		streamKind:           StreamKindClient,
 	}
 	stream := newStreamWithOptions(ctx, frame.RequestID, frame.Function, c.server.codec, func(writeFrame Frame) error {
 		if err := c.write(writeFrame); err != nil {
@@ -1740,15 +1768,16 @@ func (c *Conn) startBidiStream(frame Frame) {
 
 	ctx, cancel := contextFromFrame(frame)
 	rpcCtx := &Context{
-		Context:    ctx,
-		clientName: c.clientName,
-		requestID:  frame.RequestID,
-		function:   frame.Function,
-		remoteAddr: c.conn.RemoteAddr(),
-		localAddr:  c.conn.LocalAddr(),
-		conn:       c,
-		stream:     true,
-		streamKind: StreamKindBidi,
+		Context:              ctx,
+		clientName:           c.clientName,
+		requestID:            frame.RequestID,
+		function:             frame.Function,
+		remoteAddr:           c.conn.RemoteAddr(),
+		localAddr:            c.conn.LocalAddr(),
+		conn:                 c,
+		connectionGeneration: c.connectionGeneration,
+		stream:               true,
+		streamKind:           StreamKindBidi,
 	}
 	stream := newStreamWithOptions(ctx, frame.RequestID, frame.Function, c.server.codec, func(writeFrame Frame) error {
 		if err := c.write(writeFrame); err != nil {

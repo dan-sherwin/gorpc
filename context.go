@@ -11,15 +11,16 @@ import (
 type Context struct {
 	context.Context
 
-	clientName string
-	requestID  uint64
-	function   string
-	remoteAddr net.Addr
-	localAddr  net.Addr
-	conn       *Conn
-	notify     bool
-	stream     bool
-	streamKind StreamKind
+	clientName           string
+	requestID            uint64
+	function             string
+	remoteAddr           net.Addr
+	localAddr            net.Addr
+	conn                 *Conn
+	connectionGeneration uint64
+	notify               bool
+	stream               bool
+	streamKind           StreamKind
 }
 
 var _ context.Context = (*Context)(nil)
@@ -96,6 +97,18 @@ func (c *Context) LocalAddr() net.Addr {
 	}
 
 	return c.localAddr
+}
+
+// ConnectionGeneration returns the opaque, process-local generation of the
+// physical connection that delivered this message. It is always nonzero for a
+// dispatched handler and changes when a dialing Client reconnects, even though
+// the logical Client or Peer remains the same.
+func (c *Context) ConnectionGeneration() uint64 {
+	if c == nil {
+		return 0
+	}
+
+	return c.connectionGeneration
 }
 
 // Conn returns the accepted connection that delivered this request when the

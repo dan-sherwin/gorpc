@@ -9,6 +9,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Added `PeerManager`, `PeerClient`, and `PeerStatus` for process-wide, full-duplex peer connection ownership.
 - Added handshake-time duplicate rejection with `ErrPeerConnected` and deterministic simultaneous-dial arbitration.
 - Added managed peer support for unary calls, notifications, and all three streaming shapes.
+- Added opaque process-local physical-connection generations on handler `Context`, accepted `Conn`, and `PeerStatus`; automatic client reconnects receive a fresh generation.
+- Added `Conn.Done` to observe accepted physical-connection closure.
+- Added generation-bound `PeerEndpoint` callbacks that cannot switch to an automatically reconnected physical connection.
 
 ### Changed
 - Connection lifecycle callbacks now preserve connect-before-disconnect ordering, including short-lived connections.
