@@ -42,17 +42,7 @@ jobs:
         run: go test -race -tags=integration ./... -count=1
 
       - name: Fuzz frame decoder
-        run: |
-          (
-            while true; do
-              free -m
-              ps -eo pid,ppid,rss,etime,comm --sort=-rss | sed -n '1,10p'
-              sleep 5
-            done
-          ) &
-          fuzz_monitor_pid=$!
-          trap 'kill "$fuzz_monitor_pid" 2>/dev/null || true' EXIT
-          go test -run '^$' -fuzz=FuzzReadFrame -fuzztime=2000000x -parallel=4 -timeout=5m
+        run: go test -run '^$' -fuzz=FuzzReadFrame -fuzztime=2000000x -parallel=4 -timeout=5m
 
       - name: Fuzz MessagePack payloads
         run: go test -run '^$' -fuzz=FuzzMessagePack -fuzztime=2000000x -parallel=4 -timeout=5m
