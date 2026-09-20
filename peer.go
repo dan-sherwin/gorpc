@@ -56,8 +56,10 @@ type PeerStatus struct {
 	// ConnectionGeneration is the opaque, nonzero process-local identity of
 	// the current physical connection. It changes after an automatic reconnect.
 	ConnectionGeneration uint64
-	Dialing              bool
-	LastError            string
+	// StreamFlowControl is true when the active connection negotiated stream credit.
+	StreamFlowControl bool
+	Dialing           bool
+	LastError         string
 }
 
 type peerDialConfig struct {
@@ -549,6 +551,7 @@ func (p *Peer) Status() PeerStatus {
 	switch p.active.direction {
 	case PeerDirectionInbound:
 		status.Active = p.active.ready
+		status.StreamFlowControl = p.active.ready && p.active.conn.SupportsStreamFlowControl()
 		status.ConnectionGeneration = p.active.conn.ConnectionGeneration()
 		status.LocalAddress = addrString(p.active.conn.LocalAddr())
 		status.RemoteAddress = addrString(p.active.conn.RemoteAddr())
@@ -562,6 +565,7 @@ func (p *Peer) Status() PeerStatus {
 		conn, generation, active := p.active.client.currentConnWithGeneration()
 		status.Active = active
 		if active {
+			status.StreamFlowControl = p.active.client.streamFlowControlFor(conn)
 			status.ConnectionGeneration = generation
 			status.LocalAddress = addrString(conn.LocalAddr())
 			status.RemoteAddress = addrString(conn.RemoteAddr())
@@ -741,12 +745,13 @@ func (p *Peer) WaitReady(ctx context.Context) error {
 			return ErrClosed
 		}
 		active := p.active
+		activeReady := active != nil && active.ready
 		ready := p.ready
 		dialing := p.dialing
 		dialDone := p.dialDone
 		lastErr := p.lastDialErr
 		p.mu.Unlock()
-		if active != nil && active.ready {
+		if activeReady {
 			if active.client != nil {
 				err := active.client.WaitReady(ctx)
 				if err == nil {

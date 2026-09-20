@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"reflect"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,8 +52,8 @@ type ServerStreamHandlerFunc[Req, Item any] func(*Context, Req, *StreamWriter[It
 // final response.
 type ClientStreamHandlerFunc[Item, Resp any] func(*Context, *StreamReader[Item]) (Resp, error)
 
-// BidiStreamHandlerFunc receives and sends stream items until either side
-// closes its sending direction.
+// BidiStreamHandlerFunc receives and sends stream items independently. Closing
+// one sending direction leaves the other direction open.
 type BidiStreamHandlerFunc[Recv, Send any] func(*Context, *BidiStreamHandle[Send, Recv]) error
 
 // Server accepts GoRPC connections, dispatches registered functions, and exposes
@@ -92,7 +93,7 @@ type Server struct {
 	bidiStreamHandlers  map[string]bidiStreamHandler
 
 	listenerMu sync.Mutex
-	listener   net.Listener
+	listeners  map[net.Listener]struct{}
 
 	connMu sync.Mutex
 	conns  map[*Conn]struct{}
@@ -149,6 +150,7 @@ func NewServer(opts ServerOptions) *Server {
 		serverStreamHandlers: make(map[string]serverStreamHandler),
 		clientStreamHandlers: make(map[string]clientStreamHandler),
 		bidiStreamHandlers:   make(map[string]bidiStreamHandler),
+		listeners:            make(map[net.Listener]struct{}),
 		conns:                make(map[*Conn]struct{}),
 	}
 }
@@ -529,15 +531,18 @@ func (s *Server) ServeUnixPacket(path string) error {
 }
 
 // ServeListener accepts GoRPC connections from ln until Shutdown is called or
-// the listener returns an unrecoverable error.
+// the listener returns an unrecoverable error. It always closes ln before
+// returning. A Server may serve multiple listeners concurrently.
 func (s *Server) ServeListener(ln net.Listener) error {
 	if ln == nil {
 		return fmt.Errorf("%w: nil listener", ErrProtocol)
 	}
+	defer func() { _ = ln.Close() }()
 	if !s.setListener(ln) {
 		return ErrClosed
 	}
 	defer s.clearListener(ln)
+	defer s.wg.Done()
 
 	for {
 		conn, err := ln.Accept()
@@ -556,7 +561,7 @@ func (s *Server) ServeListener(ln net.Listener) error {
 	}
 }
 
-// Shutdown closes the listener, closes active connections, and waits for handlers to exit.
+// Shutdown closes all listeners and connections, and waits for handlers to exit.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -564,8 +569,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	s.shuttingDown.Store(true)
 	s.listenerMu.Lock()
-	if s.listener != nil {
-		_ = s.listener.Close()
+	for ln := range s.listeners {
+		_ = ln.Close()
 	}
 	s.listenerMu.Unlock()
 
@@ -591,9 +596,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func (s *Server) serveConn(conn net.Conn) {
 	sc := newConn(s, conn)
-	clientName, compressor, err := s.serverHandshake(conn, func(clientName string, compressor Compressor) error {
+	if !s.addConn(sc) {
+		_ = sc.close()
+		return
+	}
+	defer s.removeConn(sc)
+	_, _, err := s.serverHandshake(conn, func(clientName string, compressor Compressor, flowControl bool) error {
 		sc.clientName = clientName
 		sc.compressor = compressor
+		sc.flowControl = flowControl
 		if s.peerManager != nil {
 			return s.peerManager.acceptInbound(sc)
 		}
@@ -615,9 +626,7 @@ func (s *Server) serveConn(conn net.Conn) {
 			return
 		}
 	}
-	sc.clientName = clientName
-	sc.compressor = compressor
-	s.addConn(sc)
+	sc.ready.Store(true)
 
 	connectionDone := make(chan struct{})
 	lifecycleDone := make(chan struct{})
@@ -633,7 +642,6 @@ func (s *Server) serveConn(conn net.Conn) {
 		if s.peerManager != nil {
 			s.peerManager.disconnected(sc)
 		}
-		s.removeConn(sc)
 		_ = sc.close()
 	}()
 
@@ -654,16 +662,20 @@ func (s *Server) serveConn(conn net.Conn) {
 			sc.startNotify(frame)
 		case FrameStreamStart:
 			sc.startStream(frame)
-		case FrameStreamItem, FrameStreamEnd:
+		case FrameStreamItem, FrameStreamEnd, FrameStreamWindow:
 			if !sc.deliverStreamFrame(frame) {
 				s.logDebug("gorpc discarded stream frame for unknown request", "type", frame.Type.String(), "request_id", frame.RequestID)
 			}
 		case FrameResponse:
-			if !sc.complete(frame.RequestID, clientResponse{frame: frame}) {
+			if stream := sc.findStream(frame.RequestID); stream != nil && !stream.receivesItems {
+				sc.complete(frame.RequestID, clientResponse{frame: frame})
+				stream.finish(ErrClosed)
+			} else if !sc.complete(frame.RequestID, clientResponse{frame: frame}) {
 				s.logDebug("gorpc discarded response for unknown request", "request_id", frame.RequestID)
 			}
 		case FrameError:
-			if !sc.complete(frame.RequestID, clientResponse{frame: frame}) && !sc.deliverStreamFrame(frame) {
+			completed := sc.complete(frame.RequestID, clientResponse{frame: frame})
+			if !sc.deliverStreamFrame(frame) && !completed {
 				s.logDebug("gorpc discarded error for unknown request", "request_id", frame.RequestID)
 			}
 		case FrameCancel:
@@ -681,7 +693,7 @@ func (s *Server) serveConn(conn net.Conn) {
 	}
 }
 
-func (s *Server) serverHandshake(conn net.Conn, accept func(string, Compressor) error) (string, Compressor, error) {
+func (s *Server) serverHandshake(conn net.Conn, accept func(string, Compressor, bool) error) (string, Compressor, error) {
 	if s.handshakeTimeout > 0 {
 		_ = conn.SetDeadline(time.Now().Add(s.handshakeTimeout))
 		defer func() {
@@ -720,6 +732,9 @@ func (s *Server) serverHandshake(conn net.Conn, accept func(string, Compressor) 
 		Codec:           s.codec.Name(),
 		Compression:     hello.Compression,
 	}
+	if slices.Contains(hello.Capabilities, capabilityStreamCredit) {
+		ack.Capabilities = []string{capabilityStreamCredit}
+	}
 	var authChallenge []byte
 	if s.auth.enabledAuth() {
 		authChallenge, err = s.auth.challenge()
@@ -735,11 +750,11 @@ func (s *Server) serverHandshake(conn net.Conn, accept func(string, Compressor) 
 		if err := s.writeHelloAck(conn, ack); err != nil {
 			return "", nil, err
 		}
-		if err := s.readAuth(conn, hello, authChallenge); err != nil {
+		if err := s.readAuth(conn, hello, authChallenge, ack.Capabilities...); err != nil {
 			return "", nil, err
 		}
 		if accept != nil {
-			if err := accept(hello.ClientName, compressor); err != nil {
+			if err := accept(hello.ClientName, compressor, len(ack.Capabilities) != 0); err != nil {
 				_ = s.writePeerHandshakeError(conn, err)
 				return "", nil, err
 			}
@@ -750,7 +765,7 @@ func (s *Server) serverHandshake(conn net.Conn, accept func(string, Compressor) 
 		return hello.ClientName, compressor, nil
 	}
 	if accept != nil {
-		if err := accept(hello.ClientName, compressor); err != nil {
+		if err := accept(hello.ClientName, compressor, len(ack.Capabilities) != 0); err != nil {
 			_ = s.writePeerHandshakeError(conn, err)
 			return "", nil, err
 		}
@@ -773,7 +788,7 @@ func (s *Server) writeHelloAck(conn net.Conn, ack helloAck) error {
 	})
 }
 
-func (s *Server) readAuth(conn net.Conn, hello hello, challenge []byte) error {
+func (s *Server) readAuth(conn net.Conn, hello hello, challenge []byte, capabilities ...string) error {
 	frame, err := readFrame(conn, s.maxFrameSize, s.codec)
 	if err != nil {
 		return err
@@ -801,7 +816,7 @@ func (s *Server) readAuth(conn net.Conn, hello hello, challenge []byte) error {
 		})
 		return fmt.Errorf("%w: unsupported method %q", ErrAuthentication, request.Method)
 	}
-	if !s.auth.verify(challenge, hello.ProtocolVersion, hello.Codec, hello.ClientName, request.Signature) {
+	if !s.auth.verify(challenge, hello.ProtocolVersion, hello.Codec, hello.ClientName, request.Signature, capabilities...) {
 		_ = s.writeHandshakeError(conn, RemoteError{
 			Code:    ErrorCodeUnauthorized,
 			Message: "authentication failed",
@@ -889,7 +904,8 @@ func (s *Server) setListener(ln net.Listener) bool {
 	if s.shuttingDown.Load() {
 		return false
 	}
-	s.listener = ln
+	s.listeners[ln] = struct{}{}
+	s.wg.Add(1)
 
 	return true
 }
@@ -898,9 +914,7 @@ func (s *Server) clearListener(ln net.Listener) {
 	s.listenerMu.Lock()
 	defer s.listenerMu.Unlock()
 
-	if s.listener == ln {
-		s.listener = nil
-	}
+	delete(s.listeners, ln)
 }
 
 // Connections returns a snapshot of currently accepted connections.
@@ -914,17 +928,23 @@ func (s *Server) Connections() []*Conn {
 
 	conns := make([]*Conn, 0, len(s.conns))
 	for conn := range s.conns {
-		conns = append(conns, conn)
+		if conn.ready.Load() {
+			conns = append(conns, conn)
+		}
 	}
 
 	return conns
 }
 
-func (s *Server) addConn(conn *Conn) {
+func (s *Server) addConn(conn *Conn) bool {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
 
+	if s.shuttingDown.Load() {
+		return false
+	}
 	s.conns[conn] = struct{}{}
+	return true
 }
 
 func (s *Server) removeConn(conn *Conn) {
@@ -974,6 +994,8 @@ type Conn struct {
 	conn                 net.Conn
 	clientName           string
 	compressor           Compressor
+	flowControl          bool
+	ready                atomic.Bool
 	connectionGeneration uint64
 
 	nextID       atomic.Uint64
@@ -1036,6 +1058,19 @@ func (c *Conn) LocalAddr() net.Addr {
 	}
 
 	return c.conn.LocalAddr()
+}
+
+// SupportsStreamFlowControl reports whether this connection negotiated stream credit.
+func (c *Conn) SupportsStreamFlowControl() bool {
+	if c == nil {
+		return false
+	}
+	select {
+	case <-c.closed:
+		return false
+	default:
+		return c.flowControl
+	}
 }
 
 // ConnectionGeneration returns the opaque, process-local generation assigned
@@ -1331,7 +1366,9 @@ func (c *Conn) openServerStream(ctx context.Context, function string, req any, o
 		}
 		return nil
 	}, c.removeStream, streamOpts)
+	stream.configure(StreamKindServer, true, c.flowControl)
 	if err := c.addStream(stream); err != nil {
+		stream.cancel(err)
 		return nil, err
 	}
 
@@ -1342,17 +1379,18 @@ func (c *Conn) openServerStream(ctx context.Context, function string, req any, o
 		Function:   function,
 		Payload:    payload,
 	}
+	stream.receiveWindow(&frame)
 	if deadline, ok := ctx.Deadline(); ok {
 		frame.DeadlineUnixNano = deadline.UnixNano()
 	}
 
 	if err := c.write(frame); err != nil {
-		c.removeStream(requestID)
 		stream.deliverError(fmt.Errorf("%w: %v", ErrUnavailable, err))
 		c.handleWriteError(err)
 		return nil, err
 	}
 
+	stream.watchContext()
 	return stream, nil
 }
 
@@ -1378,9 +1416,13 @@ func (c *Conn) openClientStream(ctx context.Context, function string, opts Strea
 			return err
 		}
 		return nil
-	}, c.removeStream, streamOpts)
-	stream.receivesItems = false
+	}, func(stream *Stream) {
+		c.removePending(stream.RequestID())
+		c.removeStream(stream)
+	}, streamOpts)
+	stream.configure(StreamKindClient, true, c.flowControl)
 	if err := c.addStream(stream); err != nil {
+		stream.cancel(err)
 		c.removePending(requestID)
 		return nil, nil, nil, nil, err
 	}
@@ -1390,18 +1432,19 @@ func (c *Conn) openClientStream(ctx context.Context, function string, opts Strea
 		RequestID:  requestID,
 		Function:   function,
 	}
+	stream.receiveWindow(&frame)
 	if deadline, ok := ctx.Deadline(); ok {
 		frame.DeadlineUnixNano = deadline.UnixNano()
 	}
 
 	if err := c.write(frame); err != nil {
 		c.removePending(requestID)
-		c.removeStream(requestID)
 		stream.finish(fmt.Errorf("%w: %v", ErrUnavailable, err))
 		c.handleWriteError(err)
 		return nil, nil, nil, nil, err
 	}
 
+	stream.watchContext()
 	return stream, responseCh, c.removePending, c.server.codec, nil
 }
 
@@ -1423,7 +1466,9 @@ func (c *Conn) openBidiStream(ctx context.Context, function string, opts StreamO
 		}
 		return nil
 	}, c.removeStream, streamOpts)
+	stream.configure(StreamKindBidi, true, c.flowControl)
 	if err := c.addStream(stream); err != nil {
+		stream.cancel(err)
 		return nil, err
 	}
 
@@ -1433,17 +1478,18 @@ func (c *Conn) openBidiStream(ctx context.Context, function string, opts StreamO
 		RequestID:  requestID,
 		Function:   function,
 	}
+	stream.receiveWindow(&frame)
 	if deadline, ok := ctx.Deadline(); ok {
 		frame.DeadlineUnixNano = deadline.UnixNano()
 	}
 
 	if err := c.write(frame); err != nil {
-		c.removeStream(requestID)
 		stream.deliverError(fmt.Errorf("%w: %v", ErrUnavailable, err))
 		c.handleWriteError(err)
 		return nil, err
 	}
 
+	stream.watchContext()
 	return stream, nil
 }
 
@@ -1492,11 +1538,14 @@ func (c *Conn) startRequest(frame Frame) {
 		connectionGeneration: c.connectionGeneration,
 	}
 
-	c.requestMu.Lock()
-	c.requests[frame.RequestID] = cancel
-	c.requestMu.Unlock()
+	if !c.trackRequest(frame.RequestID, cancel) {
+		cancel()
+		return
+	}
 
+	c.server.wg.Add(1)
 	go func() {
+		defer c.server.wg.Done()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				_ = c.writeError(frame, RemoteError{
@@ -1523,6 +1572,9 @@ func (c *Conn) startRequest(frame Frame) {
 			Payload:   payload,
 		}); err != nil {
 			c.handleWriteError(err)
+			if errors.Is(err, ErrBackpressure) || errors.Is(err, ErrFrameTooLarge) {
+				_ = c.writeError(frame, remoteErrorFromError(err))
+			}
 		}
 	}()
 }
@@ -1564,11 +1616,14 @@ func (c *Conn) startNotify(frame Frame) {
 		notify:               true,
 	}
 
-	c.requestMu.Lock()
-	c.requests[frame.RequestID] = cancel
-	c.requestMu.Unlock()
+	if !c.trackRequest(frame.RequestID, cancel) {
+		cancel()
+		return
+	}
 
+	c.server.wg.Add(1)
 	go func() {
+		defer c.server.wg.Done()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				c.server.logDebug("gorpc notify handler panic", "function", frame.Function, "request_id", frame.RequestID, "panic", recovered)
@@ -1646,18 +1701,31 @@ func (c *Conn) startServerStream(frame Frame) {
 		}
 		return nil
 	}, c.removeStream, c.server.streamOptions)
-	stream.receivesItems = false
+	stream.configure(StreamKindServer, false, c.flowControl)
+	rpcCtx.Context = stream.Context()
+	if stream.flow != nil && stream.sendsItems {
+		if err := stream.acceptCredit(frame); err != nil {
+			_ = c.writeError(frame, remoteErrorFromError(err))
+			cancel()
+			return
+		}
+	}
 	if err := c.addStream(stream); err != nil {
 		_ = c.writeError(frame, remoteErrorFromError(err))
 		cancel()
 		return
 	}
 
-	c.requestMu.Lock()
-	c.requests[frame.RequestID] = cancel
-	c.requestMu.Unlock()
+	if !c.trackRequest(frame.RequestID, cancel) {
+		cancel()
+		stream.finish(ErrUnavailable)
+		return
+	}
 
+	stream.watchContext()
+	c.server.wg.Add(1)
 	go func() {
+		defer c.server.wg.Done()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				_ = c.writeError(frame, RemoteError{
@@ -1665,7 +1733,6 @@ func (c *Conn) startServerStream(frame Frame) {
 					Message: fmt.Sprintf("stream handler panic: %v", recovered),
 				})
 			}
-			c.removeStream(frame.RequestID)
 			stream.finish(ErrClosed)
 			cancel()
 			c.requestMu.Lock()
@@ -1713,17 +1780,24 @@ func (c *Conn) startClientStream(frame Frame) {
 		}
 		return nil
 	}, c.removeStream, c.server.streamOptions)
+	stream.configure(StreamKindClient, false, c.flowControl)
+	rpcCtx.Context = stream.Context()
 	if err := c.addStream(stream); err != nil {
 		_ = c.writeError(frame, remoteErrorFromError(err))
 		cancel()
 		return
 	}
 
-	c.requestMu.Lock()
-	c.requests[frame.RequestID] = cancel
-	c.requestMu.Unlock()
+	if !c.trackRequest(frame.RequestID, cancel) {
+		cancel()
+		stream.finish(ErrUnavailable)
+		return
+	}
 
+	stream.watchContext()
+	c.server.wg.Add(1)
 	go func() {
+		defer c.server.wg.Done()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				_ = c.writeError(frame, RemoteError{
@@ -1731,13 +1805,17 @@ func (c *Conn) startClientStream(frame Frame) {
 					Message: fmt.Sprintf("stream handler panic: %v", recovered),
 				})
 			}
-			c.removeStream(frame.RequestID)
 			stream.finish(ErrClosed)
 			cancel()
 			c.requestMu.Lock()
 			delete(c.requests, frame.RequestID)
 			c.requestMu.Unlock()
 		}()
+
+		if err := stream.grantInitialCredit(); err != nil {
+			stream.finish(err)
+			return
+		}
 
 		payload, err := invokeClientStream(rpcCtx, stream, h, c.server.streamInterceptor)
 		if err != nil {
@@ -1752,6 +1830,9 @@ func (c *Conn) startClientStream(frame Frame) {
 			Payload:   payload,
 		}); err != nil {
 			c.handleWriteError(err)
+			if errors.Is(err, ErrBackpressure) || errors.Is(err, ErrFrameTooLarge) {
+				_ = c.writeError(frame, remoteErrorFromError(err))
+			}
 		}
 	}()
 }
@@ -1786,17 +1867,31 @@ func (c *Conn) startBidiStream(frame Frame) {
 		}
 		return nil
 	}, c.removeStream, c.server.streamOptions)
+	stream.configure(StreamKindBidi, false, c.flowControl)
+	rpcCtx.Context = stream.Context()
+	if stream.flow != nil && stream.sendsItems {
+		if err := stream.acceptCredit(frame); err != nil {
+			_ = c.writeError(frame, remoteErrorFromError(err))
+			cancel()
+			return
+		}
+	}
 	if err := c.addStream(stream); err != nil {
 		_ = c.writeError(frame, remoteErrorFromError(err))
 		cancel()
 		return
 	}
 
-	c.requestMu.Lock()
-	c.requests[frame.RequestID] = cancel
-	c.requestMu.Unlock()
+	if !c.trackRequest(frame.RequestID, cancel) {
+		cancel()
+		stream.finish(ErrUnavailable)
+		return
+	}
 
+	stream.watchContext()
+	c.server.wg.Add(1)
 	go func() {
+		defer c.server.wg.Done()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				_ = c.writeError(frame, RemoteError{
@@ -1804,13 +1899,17 @@ func (c *Conn) startBidiStream(frame Frame) {
 					Message: fmt.Sprintf("stream handler panic: %v", recovered),
 				})
 			}
-			c.removeStream(frame.RequestID)
 			stream.finish(ErrClosed)
 			cancel()
 			c.requestMu.Lock()
 			delete(c.requests, frame.RequestID)
 			c.requestMu.Unlock()
 		}()
+
+		if err := stream.grantInitialCredit(); err != nil {
+			stream.finish(err)
+			return
+		}
 
 		if err := invokeBidiStream(rpcCtx, stream, h, c.server.streamInterceptor); err != nil {
 			_ = c.writeError(frame, remoteErrorFromError(err))
@@ -1821,7 +1920,22 @@ func (c *Conn) startBidiStream(frame Frame) {
 	}()
 }
 
+func (c *Conn) trackRequest(requestID uint64, cancel context.CancelFunc) bool {
+	c.requestMu.Lock()
+	defer c.requestMu.Unlock()
+	select {
+	case <-c.closed:
+		return false
+	default:
+		c.requests[requestID] = cancel
+		return true
+	}
+}
+
 func (c *Conn) cancel(requestID uint64) {
+	if stream := c.findStream(requestID); stream != nil {
+		stream.deliverError(context.Canceled)
+	}
 	c.requestMu.Lock()
 	cancel := c.requests[requestID]
 	c.requestMu.Unlock()
@@ -1856,18 +1970,20 @@ func (c *Conn) write(frame Frame) error {
 		return c.closedError()
 	default:
 	}
-	if !c.writeLimiter.acquire() {
-		c.reportBackpressure(BackpressureInfo{
-			Side:      BackpressureSideServer,
-			Reason:    BackpressureReasonConcurrentWrites,
-			Limit:     c.server.backpressure.MaxConcurrentWrites,
-			RequestID: frame.RequestID,
-			Function:  frame.Function,
-			FrameType: frame.Type,
-		})
-		return ErrBackpressure
+	if !isControlFrame(frame.Type) {
+		if !c.writeLimiter.acquire() {
+			c.reportBackpressure(BackpressureInfo{
+				Side:      BackpressureSideServer,
+				Reason:    BackpressureReasonConcurrentWrites,
+				Limit:     c.server.backpressure.MaxConcurrentWrites,
+				RequestID: frame.RequestID,
+				Function:  frame.Function,
+				FrameType: frame.Type,
+			})
+			return ErrBackpressure
+		}
+		defer c.writeLimiter.release()
 	}
-	defer c.writeLimiter.release()
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -1891,7 +2007,7 @@ func (c *Conn) write(frame Frame) error {
 }
 
 func (c *Conn) handleWriteError(err error) {
-	if err == nil || errors.Is(err, ErrBackpressure) {
+	if err == nil || errors.Is(err, ErrBackpressure) || errors.Is(err, ErrFrameTooLarge) {
 		return
 	}
 
@@ -1910,13 +2026,14 @@ func (c *Conn) addPending(requestID uint64, pending pendingCall) error {
 	}
 
 	c.pendingMu.Lock()
-	defer c.pendingMu.Unlock()
 
 	select {
 	case <-c.closed:
+		c.pendingMu.Unlock()
 		return c.closedError()
 	default:
 		if c.server.backpressure.MaxPendingCalls > 0 && len(c.pending) >= c.server.backpressure.MaxPendingCalls {
+			c.pendingMu.Unlock()
 			c.reportBackpressure(BackpressureInfo{
 				Side:      BackpressureSideServer,
 				Reason:    BackpressureReasonPendingCalls,
@@ -1926,6 +2043,7 @@ func (c *Conn) addPending(requestID uint64, pending pendingCall) error {
 			return ErrBackpressure
 		}
 		c.pending[requestID] = pending
+		c.pendingMu.Unlock()
 		return nil
 	}
 }
@@ -1983,13 +2101,14 @@ func (c *Conn) addStream(stream *Stream) error {
 	}
 
 	c.streamMu.Lock()
-	defer c.streamMu.Unlock()
 
 	select {
 	case <-c.closed:
+		c.streamMu.Unlock()
 		return c.closedError()
 	default:
 		if c.server.backpressure.MaxActiveStreams > 0 && len(c.streams) >= c.server.backpressure.MaxActiveStreams {
+			c.streamMu.Unlock()
 			c.reportBackpressure(BackpressureInfo{
 				Side:      BackpressureSideServer,
 				Reason:    BackpressureReasonActiveStreams,
@@ -1999,16 +2118,23 @@ func (c *Conn) addStream(stream *Stream) error {
 			})
 			return ErrBackpressure
 		}
+		if _, exists := c.streams[stream.RequestID()]; exists {
+			c.streamMu.Unlock()
+			return fmt.Errorf("%w: duplicate stream request ID", ErrProtocol)
+		}
 		c.streams[stream.RequestID()] = stream
+		c.streamMu.Unlock()
 		return nil
 	}
 }
 
-func (c *Conn) removeStream(requestID uint64) {
+func (c *Conn) removeStream(stream *Stream) {
 	c.streamMu.Lock()
 	defer c.streamMu.Unlock()
 
-	delete(c.streams, requestID)
+	if c.streams[stream.RequestID()] == stream {
+		delete(c.streams, stream.RequestID())
+	}
 }
 
 func (c *Conn) findStream(requestID uint64) *Stream {
@@ -2035,6 +2161,10 @@ func (c *Conn) deliverStreamFrame(frame Frame) bool {
 			return false
 		}
 		stream.deliverEnd()
+	case FrameStreamWindow:
+		if err := stream.acceptCredit(frame); err != nil {
+			stream.abort(err)
+		}
 	case FrameError:
 		stream.deliverError(remoteErrorFromFrame(c.server.codec, frame))
 	default:

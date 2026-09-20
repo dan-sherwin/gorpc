@@ -12,10 +12,19 @@ const CompressionGzip = "gzip"
 
 // Compressor compresses and decompresses frame payloads after the GoRPC
 // handshake negotiates a matching compressor on both peers.
+// Implementations must be safe for concurrent use.
 type Compressor interface {
 	Name() string
 	Compress(data []byte) ([]byte, error)
 	Decompress(data []byte) ([]byte, error)
+}
+
+// LimitedDecompressor bounds decompressed output while it is being produced.
+// Custom compressors should implement it to avoid allocating an oversized
+// payload before MaxFrameSize can be checked.
+type LimitedDecompressor interface {
+	Compressor
+	DecompressLimit(data []byte, maxSize int64) ([]byte, error)
 }
 
 type gzipCompressor struct{}
@@ -44,6 +53,10 @@ func (gzipCompressor) Compress(data []byte) ([]byte, error) {
 }
 
 func (gzipCompressor) Decompress(data []byte) ([]byte, error) {
+	return gzipCompressor{}.DecompressLimit(data, DefaultMaxFrameSize)
+}
+
+func (gzipCompressor) DecompressLimit(data []byte, maxSize int64) ([]byte, error) {
 	reader, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
@@ -52,7 +65,15 @@ func (gzipCompressor) Decompress(data []byte) ([]byte, error) {
 		_ = reader.Close()
 	}()
 
-	return io.ReadAll(reader)
+	maxSize = normalizeMaxFrameSize(maxSize)
+	payload, err := io.ReadAll(io.LimitReader(reader, maxSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(payload)) > maxSize {
+		return nil, fmt.Errorf("%w: decompressed payload exceeds %d bytes", ErrFrameTooLarge, maxSize)
+	}
+	return payload, nil
 }
 
 func normalizeCompressor(compressor Compressor) Compressor {

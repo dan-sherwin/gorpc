@@ -50,7 +50,7 @@ func (a Auth) challenge() ([]byte, error) {
 	return challenge, nil
 }
 
-func (a Auth) sign(challenge []byte, protocolVersion uint16, codec string, clientName string) []byte {
+func (a Auth) sign(challenge []byte, protocolVersion uint16, codec string, clientName string, capabilities ...string) []byte {
 	h := hmac.New(sha256.New, a.sharedSecret)
 	_, _ = h.Write([]byte("gorpc-auth-v1"))
 
@@ -61,12 +61,16 @@ func (a Auth) sign(challenge []byte, protocolVersion uint16, codec string, clien
 	writeAuthString(h, codec)
 	writeAuthString(h, clientName)
 	_, _ = h.Write(challenge)
+	// Keep the legacy transcript unchanged when no extension was negotiated.
+	for _, capability := range capabilities {
+		writeAuthString(h, capability)
+	}
 
 	return h.Sum(nil)
 }
 
-func (a Auth) verify(challenge []byte, protocolVersion uint16, codec string, clientName string, signature []byte) bool {
-	expected := a.sign(challenge, protocolVersion, codec, clientName)
+func (a Auth) verify(challenge []byte, protocolVersion uint16, codec string, clientName string, signature []byte, capabilities ...string) bool {
+	expected := a.sign(challenge, protocolVersion, codec, clientName, capabilities...)
 	return hmac.Equal(expected, signature)
 }
 

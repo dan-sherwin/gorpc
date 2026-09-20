@@ -5,16 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
+
+## [v1.0.0-rc.4] - 2026-09-20
+
 ### Added
-- Added `PeerManager`, `PeerClient`, and `PeerStatus` for process-wide, full-duplex peer connection ownership.
-- Added handshake-time duplicate rejection with `ErrPeerConnected` and deterministic simultaneous-dial arbitration.
-- Added managed peer support for unary calls, notifications, and all three streaming shapes.
-- Added opaque process-local physical-connection generations on handler `Context`, accepted `Conn`, and `PeerStatus`; automatic client reconnects receive a fresh generation.
-- Added `Conn.Done` to observe accepted physical-connection closure.
-- Added generation-bound `PeerEndpoint` callbacks that cannot switch to an automatically reconnected physical connection.
+
+- Runnable examples for server, client, and bidirectional streaming, plus managed peers and reconnect behavior.
+- Executable Go documentation examples and race-enabled command smoke tests that check documented output.
+- Focused guides for calls, managed peers, and service deployment decisions, with an example index and shorter getting-started README.
+- A README introduction to when GoRPC fits and a choosing guide covering use cases, design tradeoffs, and alternatives.
+
+- Negotiated `stream-credit-v1` flow control with independent item and byte windows in each direction.
+- `StreamOptions.RecvBytes`, `SupportsStreamFlowControl` on clients and accepted connections, and `PeerStatus.StreamFlowControl`.
+- Bounded gzip decompression and the optional `LimitedDecompressor` interface for custom compressors.
+- Released-peer interoperability tests against `v1.0.0-rc.2` and `v1.0.0-rc.3`, stream stress tests, and frame decoder fuzzing.
 
 ### Changed
-- Connection lifecycle callbacks now preserve connect-before-disconnect ordering, including short-lived connections.
+
+- The inventory example shares its contract types, bounds startup and callback waits, supports optional authentication, and shuts down on signals.
+
+- Raised the Go toolchain baseline to `1.26.6` for standard-library security fixes.
+- `MaxFrameSize` now limits uncompressed payloads as well as encoded wire frames.
+- Stream receive queues no longer block the connection reader. Legacy peers remain compatible; queue overflow on an updated receiver fails that stream with `ErrBackpressure`.
+- Stream control traffic bypasses the optional concurrent-write admission limit.
+- Stream credit returns are batched while receive queues are nonempty, and sender wakeups reuse a bounded channel.
+- TCP frame writes gather the length prefix and body without copying the payload.
+- Server shutdown closes pending handshakes and waits for handlers to return.
+
+### Fixed
+
+- Closing a client during its initial handshake no longer races connection publication or panics on a closed readiness channel.
+- Concurrent connection attempts share one handshake and honor each caller's cancellation.
+- Bidirectional streams keep their remaining send direction alive after a remote half-close.
+- Remote errors and early client-stream responses wake blocked senders without losing the final response.
+- Stream deadline notifications preserve `deadline_exceeded` instead of racing a generic cancellation at the peer.
+- Cleanup from an old connection cannot remove a replacement stream or request that reused its ID.
+- Peer readiness is read under its lock, and backpressure callbacks run outside pending-call and stream-map locks.
+- Short frame writes are detected, and recognized remote error codes work with `errors.Is`.
+- Responses rejected by local size or write limits return an error to the caller instead of leaving it waiting.
+- Shutdown closes every listener on a server, and `ServeListener` closes its listener on every return path.
+
+## [v1.0.0-rc.3] - 2026-08-18
+
+### Added
+
+- Opaque process-local physical-connection generations on handler `Context`, accepted `Conn`, and `PeerStatus`; automatic client reconnects receive a fresh generation.
+- `Conn.Done` to observe accepted physical-connection closure.
+- Generation-bound `PeerEndpoint` callbacks that cannot switch to an automatically reconnected physical connection.
+
+## [v1.0.0-rc.2] - 2026-07-20
+
+### Added
+
+- `PeerManager`, `PeerClient`, and `PeerStatus` for process-wide, full-duplex peer connection ownership.
+- Handshake-time duplicate rejection with `ErrPeerConnected` and deterministic simultaneous-dial arbitration.
+- Managed peer support for unary calls, notifications, and all three streaming shapes.
+
+### Changed
+
+- Connection lifecycle callbacks preserve connect-before-disconnect ordering, including short-lived connections.
 - Managed peers cancel redundant dials, stop losing reconnect loops, and retain at most one physical connection per peer pair.
 
 ## [v1.0.0-rc.1] - 2026-07-08
@@ -75,7 +124,10 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Optional `slog` debug logging hooks.
 - CI workflow covering tidy, build, vet, race tests, lint, and govulncheck.
 
-[Unreleased]: https://github.com/dan-sherwin/gorpc/compare/v1.0.0-rc.1...HEAD
+[Unreleased]: https://github.com/dan-sherwin/gorpc/compare/v1.0.0-rc.4...HEAD
+[v1.0.0-rc.4]: https://github.com/dan-sherwin/gorpc/releases/tag/v1.0.0-rc.4
+[v1.0.0-rc.3]: https://github.com/dan-sherwin/gorpc/releases/tag/v1.0.0-rc.3
+[v1.0.0-rc.2]: https://github.com/dan-sherwin/gorpc/releases/tag/v1.0.0-rc.2
 [v1.0.0-rc.1]: https://github.com/dan-sherwin/gorpc/releases/tag/v1.0.0-rc.1
 [v0.5.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.5.0
 [v0.4.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v0.4.0

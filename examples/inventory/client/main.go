@@ -1,92 +1,122 @@
-// Package main runs the GoRPC Inventory example client.
+// Package main runs the inventory example client.
 package main
 
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"time"
 
 	"github.com/dan-sherwin/gorpc"
+	"github.com/dan-sherwin/gorpc/examples/inventory/api"
 )
 
-type GetItemRequest struct {
-	ID string
-}
-
-type GetItemResponse struct {
-	ID   string
-	Name string
-}
-
-type ClientNote struct {
-	ItemID string
-}
-
 func main() {
-	const addr = "127.0.0.1:9070"
-	const itemID = "widget-001"
-
-	client := gorpc.NewTCPClient(addr, "inventory-example-client")
-	gorpc.MustRegisterNotify(client, "client_note", clientNote)
-
-	if err := client.Connect(context.Background()); err != nil {
+	address := flag.String("addr", "127.0.0.1:9070", "server address")
+	flag.Parse()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := run(ctx, *address, os.Getenv("GORPC_EXAMPLE_SECRET"), os.Stdout); err != nil {
 		log.Fatal(err)
 	}
-	defer func() {
-		_ = client.Close()
-	}()
-
-	getItemSync(client, itemID)
-	getItemAsync(client, "widget-async", "example-async-1")
-	getMissingItemSync(client)
 }
 
-func clientNote(_ *gorpc.Context, note ClientNote) error {
-	fmt.Println("server push: client saw request for", note.ItemID)
+func run(ctx context.Context, address, secret string, out io.Writer) error {
+	options := gorpc.ClientOptions{}
+	if secret != "" {
+		options.Auth = gorpc.SharedSecret(secret)
+	}
+	client := gorpc.NewTCPClient(address, "inventory-client", options)
+	defer func() { _ = client.Close() }()
+
+	// Callbacks only hand off values. One goroutine owns the output below.
+	notes := make(chan api.ClientNote, 2)
+	gorpc.MustRegisterNotify(client, api.Note, func(_ *gorpc.Context, note api.ClientNote) error {
+		select {
+		case notes <- note:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	if err := client.Connect(ctx); err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+
+	var item api.GetItemResponse
+	if err := client.CallContext(ctx, api.GetItem, api.GetItemRequest{ID: "widget-001"}, &item); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "%s: %s\n", item.ID, item.Name); err != nil {
+		return err
+	}
+	if err := printNote(ctx, notes, out); err != nil {
+		return err
+	}
+	if err := getItemAsync(ctx, client, out); err != nil {
+		return err
+	}
+	if err := printNote(ctx, notes, out); err != nil {
+		return err
+	}
+
+	err := client.CallContext(ctx, api.GetItem, api.GetItemRequest{ID: "missing-item"}, &item)
+	var remote *gorpc.RemoteError
+	if !errors.As(err, &remote) || remote.Code != gorpc.ErrorCodeNotFound {
+		return fmt.Errorf("expected not_found, got %v", err)
+	}
+	if _, err := fmt.Fprintf(out, "missing item: %s (%s)\n", remote.Code, remote.Message); err != nil {
+		return err
+	}
 	return nil
 }
 
-func getItemSync(client *gorpc.Client, itemID string) {
-	var item GetItemResponse
-	if err := client.CallWithTimeout("get_an_item", GetItemRequest{ID: itemID}, &item, 5*time.Second); err != nil {
-		log.Fatal(err)
-	}
-	fmt.Printf("%s: %s\n", item.ID, item.Name)
-}
-
-func getItemAsync(client *gorpc.Client, itemID string, correlationID string) {
-	done := make(chan error, 1)
-	if err := client.AsyncCall("get_an_item", GetItemRequest{ID: itemID}, func(ctx gorpc.ClientContext, resp *GetItemResponse) {
-		if ctx.Error() != nil {
-			done <- ctx.Error()
-			return
+func printNote(ctx context.Context, notes <-chan api.ClientNote, out io.Writer) error {
+	select {
+	case note := <-notes:
+		if _, err := fmt.Fprintln(out, "server push:", note.ItemID); err != nil {
+			return err
 		}
-
-		fmt.Printf("async %s: %s: %s\n", ctx.CorrelationID(), resp.ID, resp.Name)
-		done <- nil
-	}, correlationID); err != nil {
-		log.Fatal(err)
-	}
-	err := <-done
-	if err != nil {
-		log.Fatal(err)
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-func getMissingItemSync(client *gorpc.Client) {
-	// Missing item example: the server returns a structured RemoteError.
-	var missing GetItemResponse
-	err := client.CallWithTimeout("get_an_item", GetItemRequest{ID: "missing-item"}, &missing, 5*time.Second)
-	if err == nil {
-		return
+func getItemAsync(ctx context.Context, client *gorpc.Client, out io.Writer) error {
+	type result struct {
+		item api.GetItemResponse
+		id   string
+		err  error
+	}
+	done := make(chan result, 1)
+	if err := client.AsyncCallContext(ctx, api.GetItem, api.GetItemRequest{ID: "widget-async"},
+		func(call gorpc.ClientContext, item *api.GetItemResponse) {
+			response := result{id: call.CorrelationID(), err: call.Error()}
+			if response.err == nil {
+				response.item = *item
+			}
+			done <- response
+		}, "request-2"); err != nil {
+		return err
 	}
 
-	var remoteErr *gorpc.RemoteError
-	if errors.As(err, &remoteErr) {
-		fmt.Printf("missing item: code=%s message=%q details=%v\n", remoteErr.Code, remoteErr.Message, remoteErr.Details)
-	} else {
-		log.Fatal(err)
+	// AsyncCallContext bounds sending, not the callback wait. Bound that wait
+	// explicitly; the buffered channel also accepts a late callback safely.
+	select {
+	case response := <-done:
+		if response.err != nil {
+			return response.err
+		}
+		if _, err := fmt.Fprintf(out, "async %s: %s: %s\n", response.id, response.item.ID, response.item.Name); err != nil {
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

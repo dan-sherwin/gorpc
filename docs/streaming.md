@@ -9,6 +9,12 @@ The words client and server only describe who dialed and who accepted the
 socket. After the connection is established, either side can register stream
 handlers and either side can open streams.
 
+Complete programs with commands and expected output are available for
+[server streaming](../examples/serverstream/README.md),
+[client streaming](../examples/clientstream/README.md), and
+[bidirectional streaming](../examples/bidistream/README.md). The snippets here
+are excerpts for application setup or functions that return an error.
+
 ## Stream Shapes
 
 GoRPC supports three stream shapes:
@@ -30,6 +36,7 @@ Opening helpers accept either:
 
 - `*gorpc.Client` from the dialing side.
 - `*gorpc.Conn` from the accepted side.
+- `*gorpc.Peer` or `*gorpc.PeerClient` for a managed relationship.
 
 That means the accepted side can open streams back to the dialing side using
 the same helper functions.
@@ -90,13 +97,18 @@ gorpc.MustRegisterServerStream(server, "list_items", func(ctx *gorpc.Context, re
 Caller:
 
 ```go
-reader, err := gorpc.ServerStream[ListItemsRequest, ItemEvent](context.Background(), client, "list_items", ListItemsRequest{
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+reader, err := gorpc.ServerStream[ListItemsRequest, ItemEvent](ctx, client, "list_items", ListItemsRequest{
 	Prefix: "widget",
 	Count:  3,
 })
 if err != nil {
-	log.Fatal(err)
+	return err
 }
+
+defer func() { _ = reader.Cancel() }()
 
 for {
 	item, err := reader.Recv()
@@ -104,7 +116,7 @@ for {
 		break
 	}
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	fmt.Println(item.ID, item.Value)
 }
@@ -138,20 +150,25 @@ gorpc.MustRegisterClientStream(server, "upload_items", func(ctx *gorpc.Context, 
 Caller:
 
 ```go
-stream, err := gorpc.ClientStream[ItemEvent, UploadSummary](context.Background(), client, "upload_items")
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+stream, err := gorpc.ClientStream[ItemEvent, UploadSummary](ctx, client, "upload_items")
 if err != nil {
-	log.Fatal(err)
+	return err
 }
+
+defer func() { _ = stream.Cancel() }()
 
 for _, item := range items {
 	if err := stream.Send(item); err != nil {
-		log.Fatal(err)
+		return err
 	}
 }
 
 summary, err := stream.CloseAndRecv()
 if err != nil {
-	log.Fatal(err)
+	return err
 }
 fmt.Println(summary.Count)
 ```
@@ -185,62 +202,40 @@ gorpc.MustRegisterBidiStream(server, "echo_items", func(ctx *gorpc.Context, stre
 Caller:
 
 ```go
-stream, err := gorpc.BidiStream[ItemEvent, ItemEvent](context.Background(), client, "echo_items")
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+stream, err := gorpc.BidiStream[ItemEvent, ItemEvent](ctx, client, "echo_items")
 if err != nil {
-	log.Fatal(err)
+	return err
 }
 
+defer func() { _ = stream.Cancel() }()
+
 if err := stream.Send(ItemEvent{ID: "widget-1", Value: "ready"}); err != nil {
-	log.Fatal(err)
+	return err
 }
 
 reply, err := stream.Recv()
 if err != nil {
-	log.Fatal(err)
+	return err
 }
 fmt.Println(reply.Value)
 
 if err := stream.CloseSend(); err != nil {
-	log.Fatal(err)
+	return err
+}
+// This one-item echo handler has no more replies. Wait for clean completion.
+if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
+	return fmt.Errorf("expected EOF, got %v", err)
 }
 ```
 
-Concurrent send and receive pattern:
-
-```go
-stream, err := gorpc.BidiStream[ItemEvent, ItemEvent](ctx, client, "watch_items")
-if err != nil {
-	return err
-}
-defer stream.Cancel()
-
-sendErr := make(chan error, 1)
-go func() {
-	defer close(sendErr)
-	for _, item := range items {
-		if err := stream.Send(item); err != nil {
-			sendErr <- err
-			return
-		}
-	}
-	sendErr <- stream.CloseSend()
-}()
-
-for {
-	item, err := stream.Recv()
-	if errors.Is(err, io.EOF) {
-		break
-	}
-	if err != nil {
-		return err
-	}
-	fmt.Println(item)
-}
-
-if err := <-sendErr; err != nil {
-	return err
-}
-```
+For more than a one-item exchange, send and receive concurrently. Otherwise
+both sides can fill their receive windows and wait for each other. The
+[bidirectional example](../examples/bidistream/main.go) shows the complete
+pattern: one sender, one receiver, cancellation on either failure, and joining
+the sender during cleanup. It also reads a final summary after half-closing.
 
 ## Server-Initiated Streams
 
@@ -251,7 +246,9 @@ with the connection.
 ```go
 server := gorpc.NewServer(gorpc.ServerOptions{
 	OnConnect: func(conn *gorpc.Conn) {
-		reader, err := gorpc.ServerStream[ListItemsRequest, ItemEvent](context.Background(), conn, "client_list_items", ListItemsRequest{
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		reader, err := gorpc.ServerStream[ListItemsRequest, ItemEvent](ctx, conn, "client_list_items", ListItemsRequest{
 			Prefix: "client",
 			Count:  2,
 		})
@@ -260,6 +257,7 @@ server := gorpc.NewServer(gorpc.ServerOptions{
 			return
 		}
 
+		defer func() { _ = reader.Cancel() }()
 		for {
 			item, err := reader.Recv()
 			if errors.Is(err, io.EOF) {
@@ -289,9 +287,12 @@ gorpc.MustRegisterServerStream(client, "client_list_items", func(ctx *gorpc.Cont
 	return nil
 })
 
-if err := client.Connect(context.Background()); err != nil {
-	log.Fatal(err)
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+if err := client.Connect(ctx); err != nil {
+	return err
 }
+defer func() { _ = client.Close() }()
 ```
 
 ## Context And Cancellation
@@ -321,6 +322,18 @@ Stream methods:
 - `ErrUnavailable` when the connection breaks.
 - `context.Canceled` or `context.DeadlineExceeded` when local context ends.
 - `*gorpc.RemoteError` when the remote stream handler returns a structured error.
+
+Already-buffered items are delivered before a terminal error or EOF. A
+client-stream handler may return a final response before reading every item;
+this wakes blocked senders, and `CloseAndRecv` still returns that response.
+
+`Send` and `Recv` can run concurrently. Multiple `Send` calls are serialized,
+but their order across goroutines is unspecified. Use one receiving goroutine
+per stream when item processing order matters. In a bidirectional exchange,
+keep receiving while sending: if both peers only send until their windows fill,
+both will wait. `CloseSend` interrupts a sender waiting for credit and orders the
+end frame after any item already being written. A remote half-close does not
+prevent the local side from sending its remaining items.
 
 ## Network Interruptions
 
@@ -364,23 +377,42 @@ The same `MaxFrameSize` limit applies to:
 - stream end frames
 - error frames
 
-The default `MaxFrameSize` is 64 MiB per encoded frame. Streaming lets you avoid
-one huge response, but it does not make a single item larger than the frame
-limit.
+The default `MaxFrameSize` is 64 MiB. Both the encoded wire frame and the
+uncompressed payload must fit. With flow control, each encoded item must also
+fit the receiver's `RecvBytes` window, even when compression makes it smaller on
+the wire. A window-size rejection returns `ErrFrameTooLarge` before sending the
+item; a smaller item can be sent on the same stream.
 
 For very large datasets, prefer many smaller stream items over one massive
 item.
 
-## Stream Buffers
+## Receive Windows And Compatibility
 
-Each stream has a receive buffer. The default is 16 frames. Configure the
-process-wide default with `ClientOptions.StreamOptions` or
+Each stream defaults to a receive window of 16 items and 64 MiB of uncompressed
+encoded payloads. Configure `StreamOptions.RecvBuffer` and `RecvBytes` as the
+client/server default with `ClientOptions.StreamOptions` or
 `ServerOptions.StreamOptions`, or override a single stream with
 `ServerStreamWithOptions`, `ClientStreamWithOptions`, or
 `BidiStreamWithOptions`.
 
-Larger buffers can smooth bursts, but they do not change `MaxFrameSize` and do
-not make active streams survive reconnect.
+When both ends support `stream-credit-v1`, `Send` waits for available item and
+byte credit. The receiver batches credit as application code calls `Recv`,
+returning it when half either window is consumed or the receive queue empties.
+Credit tracks queue capacity, not completion of application processing. A slow
+reader stalls its own sender, not the shared connection reader or other streams.
+Cancellation, deadlines, remote termination, and connection loss wake a sender
+waiting for credit.
+
+If either end is older, no credit frames are sent. Updated receivers reject
+queue overflow with `ErrBackpressure` rather than stalling the connection.
+Older receivers retain their previous behavior. Mixed versions can communicate,
+but upgrade both ends for flow control. Inspect the mode with
+`SupportsStreamFlowControl` on a client or accepted connection, or with
+`PeerStatus.StreamFlowControl` for managed peers.
+
+Larger windows can smooth bursts, but increase per-stream memory use. They do
+not change `MaxFrameSize` or make streams survive reconnect. The wire extension
+is described in [protocol.md](protocol.md).
 
 ## Errors
 
@@ -394,6 +426,10 @@ return gorpc.NewRemoteError(gorpc.ErrorCodeNotFound, "item not found", map[strin
 
 The peer receives a `*gorpc.RemoteError`.
 
+`errors.Is` recognizes remote cancellation, deadline, unavailable,
+backpressure, authentication, and duplicate-peer codes as their corresponding
+GoRPC or context errors. Use `errors.As` when you need the code or details.
+
 Handler panics are recovered and returned as structured internal errors.
 
 ## Practical Rules
@@ -406,3 +442,12 @@ Handler panics are recovered and returned as structured internal errors.
 - Keep stream items small enough to fit `MaxFrameSize`.
 - Use `CloseSend` when you are done sending but still expect more items.
 - Use `Cancel` when the whole stream should stop.
+- Give bounded operations a context deadline, and cancel a stream if you stop reading before EOF.
+
+## Measuring Throughput
+
+`go test -run '^$' -bench BenchmarkClientStream -benchmem` measures a client
+stream over loopback TCP at several item sizes, including receiver decoding and
+credit traffic. Treat it as a regression baseline, not a deployment capacity
+claim. Measure with your real payloads, latency, concurrency, and compression
+settings before choosing receive windows.

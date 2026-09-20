@@ -2,25 +2,29 @@ package gorpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 )
 
 const streamRecvBuffer = 16
 
-// StreamOptions configures newly opened streams. Zero values keep GoRPC
-// defaults.
+// StreamOptions configures newly opened streams. Zero values keep GoRPC defaults.
 type StreamOptions struct {
+	// RecvBuffer limits queued items. The default is 16.
 	RecvBuffer int
+	// RecvBytes limits queued, uncompressed item payloads. The default is 64 MiB.
+	RecvBytes int64
 }
 
 func normalizeStreamOptions(opts StreamOptions) StreamOptions {
 	if opts.RecvBuffer <= 0 {
 		opts.RecvBuffer = streamRecvBuffer
 	}
-
+	if opts.RecvBytes <= 0 {
+		opts.RecvBytes = DefaultMaxFrameSize
+	}
 	return opts
 }
 
@@ -28,7 +32,9 @@ func mergeStreamOptions(base, override StreamOptions) StreamOptions {
 	if override.RecvBuffer > 0 {
 		base.RecvBuffer = override.RecvBuffer
 	}
-
+	if override.RecvBytes > 0 {
+		base.RecvBytes = override.RecvBytes
+	}
 	return normalizeStreamOptions(base)
 }
 
@@ -40,38 +46,38 @@ type Stream struct {
 	function  string
 	codec     Codec
 	write     func(Frame) error
-	onDone    func(uint64)
+	onDone    func(*Stream)
 
 	ctx    context.Context
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 
-	recvCh   chan streamDelivery
-	recvDone chan struct{}
-
+	recvCh        chan []byte
+	recvDone      chan struct{}
+	sendDone      chan struct{}
 	receivesItems bool
-	sendClosed    atomic.Bool
-	recvClosed    atomic.Bool
-	done          atomic.Bool
+	sendsItems    bool
+	recvByteLimit uint64
+
+	// sendMu orders items before the send-side end frame. It is never held by
+	// the connection reader, which must remain free to deliver credit.
+	sendMu sync.Mutex
+	mu     sync.Mutex
+	flow   *streamFlow
+
+	bufferedBytes uint64
+	sendClosed    bool
+	sendEnded     bool
+	recvClosed    bool
+	done          bool
+	recvErr       error
+	closeSendErr  error
 
 	closeSendOnce sync.Once
-	cancelOnce    sync.Once
-	removeOnce    sync.Once
-
-	recvErrMu sync.Mutex
-	recvErr   error
 }
 
-type streamDelivery struct {
-	payload []byte
-	err     error
-	end     bool
-}
-
-func newStreamWithOptions(ctx context.Context, requestID uint64, function string, codec Codec, write func(Frame) error, onDone func(uint64), opts StreamOptions) *Stream {
-	ctx = normalizeContext(ctx)
-	streamCtx, cancel := context.WithCancel(ctx)
+func newStreamWithOptions(ctx context.Context, requestID uint64, function string, codec Codec, write func(Frame) error, onDone func(*Stream), opts StreamOptions) *Stream {
+	streamCtx, cancel := context.WithCancelCause(normalizeContext(ctx))
 	opts = normalizeStreamOptions(opts)
-
 	return &Stream{
 		requestID:     requestID,
 		function:      function,
@@ -80,10 +86,55 @@ func newStreamWithOptions(ctx context.Context, requestID uint64, function string
 		onDone:        onDone,
 		ctx:           streamCtx,
 		cancel:        cancel,
-		recvCh:        make(chan streamDelivery, opts.RecvBuffer),
+		recvCh:        make(chan []byte, opts.RecvBuffer),
 		recvDone:      make(chan struct{}),
+		sendDone:      make(chan struct{}),
 		receivesItems: true,
+		sendsItems:    true,
+		recvByteLimit: uint64(opts.RecvBytes),
 	}
+}
+
+// configure runs before the stream is published to the connection reader.
+func (s *Stream) configure(kind StreamKind, caller, flowControl bool) {
+	switch kind {
+	case StreamKindServer:
+		s.receivesItems = caller
+		s.sendsItems = !caller
+		if caller {
+			s.sendClosed = true
+			s.sendEnded = true
+			close(s.sendDone)
+		} else {
+			s.recvClosed = true
+			s.recvErr = io.EOF
+			close(s.recvDone)
+		}
+	case StreamKindClient:
+		s.receivesItems = !caller
+		s.sendsItems = caller
+		// The response keeps this stream alive after its item side closes.
+	}
+	if flowControl {
+		s.flow = &streamFlow{changed: make(chan struct{}, 1)}
+	}
+}
+
+// watchContext is installed after a stream start is sent or accepted, so a
+// cancel frame cannot overtake the start frame.
+func (s *Stream) watchContext() {
+	context.AfterFunc(s.ctx, func() {
+		err := context.Cause(s.ctx)
+		if errors.Is(err, context.DeadlineExceeded) {
+			// A bare cancel can reach the peer before its own deadline fires,
+			// replacing the timeout with context.Canceled.
+			s.abort(err)
+			return
+		}
+		if s.finish(err) {
+			_ = s.write(Frame{Type: FrameCancel, RequestID: s.requestID, Function: s.function})
+		}
+	})
 }
 
 // RequestID returns the stream request ID.
@@ -91,7 +142,6 @@ func (s *Stream) RequestID() uint64 {
 	if s == nil {
 		return 0
 	}
-
 	return s.requestID
 }
 
@@ -100,258 +150,228 @@ func (s *Stream) Function() string {
 	if s == nil {
 		return ""
 	}
-
 	return s.function
 }
 
-// Context returns the stream context. It is canceled when the stream is locally
-// canceled, the connection closes, or a remote stream error is received.
+// Context returns the stream context. It is canceled when the stream ends,
+// the connection closes, or either peer cancels the stream.
 func (s *Stream) Context() context.Context {
 	if s == nil || s.ctx == nil {
 		return context.Background()
 	}
-
 	return s.ctx
 }
 
-// Send writes one stream item. The item is MessagePack-encoded into a
-// FrameStreamItem payload.
+// Send encodes and writes one item. With negotiated flow control, it waits for
+// receiver credit or cancellation. Calls to Send are serialized.
 func (s *Stream) Send(item any) error {
-	if s == nil {
+	if s == nil || !s.sendsItems {
 		return ErrClosed
 	}
-	if s.sendClosed.Load() {
-		return ErrClosed
-	}
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 
-	select {
-	case <-s.ctx.Done():
-		return s.ctx.Err()
-	default:
+	if err := s.sendError(); err != nil {
+		return err
 	}
-
 	payload, err := s.codec.Marshal(item)
 	if err != nil {
 		return fmt.Errorf("encode stream item: %w", err)
 	}
-
-	if err := s.write(Frame{
-		Type:      FrameStreamItem,
-		RequestID: s.requestID,
-		Function:  s.function,
-		Payload:   payload,
-	}); err != nil {
-		s.finish(err)
+	if err := s.takeCredit(uint64(len(payload))); err != nil {
 		return err
 	}
+	if err := s.write(Frame{
+		Type: FrameStreamItem, RequestID: s.requestID, Function: s.function, Payload: payload,
+	}); err != nil {
+		s.abort(err)
+		return err
+	}
+	return nil
+}
 
+func (s *Stream) sendError() error {
+	if err := context.Cause(s.ctx); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sendClosed {
+		return ErrClosed
+	}
 	return nil
 }
 
 // Recv reads one stream item into item. It returns io.EOF after the remote side
-// closes its send side with a stream_end frame.
+// closes its send side and all buffered items have been consumed.
 func (s *Stream) Recv(item any) error {
-	if s == nil {
+	if s == nil || !s.receivesItems {
 		return ErrClosed
 	}
 	if item == nil {
 		return fmt.Errorf("%w: stream item must be a non-nil pointer", ErrInvalidResponse)
 	}
-
+	if err := validateResponseTarget(item); err != nil {
+		return err
+	}
+	// Drain items before reporting a terminal error or EOF.
 	select {
-	case delivery, ok := <-s.recvCh:
-		return s.receiveDelivery(delivery, ok, item)
+	case payload := <-s.recvCh:
+		return s.receivePayload(payload, item)
 	default:
 	}
 	select {
+	case payload := <-s.recvCh:
+		return s.receivePayload(payload, item)
 	case <-s.recvDone:
-		select {
-		case delivery, ok := <-s.recvCh:
-			return s.receiveDelivery(delivery, ok, item)
-		default:
-			return s.receiveError()
-		}
-	default:
-	}
-
-	select {
-	case delivery, ok := <-s.recvCh:
-		return s.receiveDelivery(delivery, ok, item)
-	case <-s.recvDone:
-		select {
-		case delivery, ok := <-s.recvCh:
-			return s.receiveDelivery(delivery, ok, item)
-		default:
-			return s.receiveError()
-		}
 	case <-s.ctx.Done():
-		select {
-		case delivery, ok := <-s.recvCh:
-			return s.receiveDelivery(delivery, ok, item)
-		default:
-			select {
-			case <-s.recvDone:
-				return s.receiveError()
-			default:
-			}
-			return s.ctx.Err()
-		}
 	}
+	select {
+	case payload := <-s.recvCh:
+		return s.receivePayload(payload, item)
+	default:
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.recvErr != nil {
+		return s.recvErr
+	}
+	return context.Cause(s.ctx)
 }
 
-func (s *Stream) receiveDelivery(delivery streamDelivery, ok bool, item any) error {
-	if !ok {
-		return io.EOF
+func (s *Stream) receivePayload(payload []byte, item any) error {
+	size := uint64(len(payload))
+	s.mu.Lock()
+	s.bufferedBytes -= size
+	s.mu.Unlock()
+
+	err := s.codec.Unmarshal(payload, item)
+	if writeErr := s.returnCredit(size); writeErr != nil {
+		s.abort(writeErr)
 	}
-	if delivery.err != nil {
-		return delivery.err
-	}
-	if delivery.end {
-		return io.EOF
-	}
-	if err := s.codec.Unmarshal(delivery.payload, item); err != nil {
+	if err != nil {
 		return fmt.Errorf("decode stream item: %w", err)
 	}
-
 	return nil
 }
 
-func (s *Stream) receiveError() error {
-	s.recvErrMu.Lock()
-	defer s.recvErrMu.Unlock()
-
-	if s.recvErr == nil {
-		return io.EOF
-	}
-
-	return s.recvErr
-}
-
-// CloseSend closes the local sending side of the stream with a stream_end
-// frame. It does not cancel receiving items from the remote side.
+// CloseSend closes the local sending side. Receiving can continue. A blocked
+// Send is interrupted; an item already being written precedes the end frame.
 func (s *Stream) CloseSend() error {
-	if s == nil {
+	if s == nil || !s.sendsItems {
 		return ErrClosed
 	}
-
-	var err error
 	s.closeSendOnce.Do(func() {
-		s.sendClosed.Store(true)
-		select {
-		case <-s.ctx.Done():
-			err = s.ctx.Err()
-			return
-		default:
-		}
+		s.mu.Lock()
+		s.sendClosed = true
+		close(s.sendDone)
+		s.mu.Unlock()
 
-		err = s.write(Frame{
-			Type:      FrameStreamEnd,
-			RequestID: s.requestID,
-			Function:  s.function,
-		})
+		s.sendMu.Lock()
+		defer s.sendMu.Unlock()
+		err := context.Cause(s.ctx)
+		if err == nil {
+			err = s.write(Frame{Type: FrameStreamEnd, RequestID: s.requestID, Function: s.function})
+		}
+		s.mu.Lock()
+		s.closeSendErr = err
+		s.sendEnded = err == nil
+		finished := s.recvClosed
+		s.mu.Unlock()
 		if err != nil {
-			s.finish(err)
+			s.abort(err)
+		} else if finished {
+			s.finish(ErrClosed)
 		}
 	})
-
-	return err
+	return s.closeSendErr
 }
 
-// Cancel cancels the whole stream and sends a best-effort cancel frame to the
-// remote side.
+// Cancel cancels the whole stream locally before sending a best-effort cancel
+// frame to the remote side.
 func (s *Stream) Cancel() error {
 	if s == nil {
 		return ErrClosed
 	}
+	if !s.finish(context.Canceled) {
+		return nil
+	}
+	return s.write(Frame{Type: FrameCancel, RequestID: s.requestID, Function: s.function})
+}
 
-	var err error
-	s.cancelOnce.Do(func() {
-		err = s.write(Frame{
-			Type:      FrameCancel,
-			RequestID: s.requestID,
-			Function:  s.function,
-		})
-		s.finish(context.Canceled)
-	})
-
-	return err
+// abort must not write on the connection reader's goroutine.
+func (s *Stream) abort(err error) {
+	if !s.finish(err) {
+		return
+	}
+	go func() {
+		payload, marshalErr := s.codec.Marshal(remoteErrorFromError(err))
+		if marshalErr == nil {
+			_ = s.write(Frame{Type: FrameError, RequestID: s.requestID, Function: s.function, Payload: payload})
+		}
+	}()
 }
 
 func (s *Stream) deliverItem(frame Frame) {
-	if s == nil || s.recvClosed.Load() {
+	s.mu.Lock()
+	if s.recvClosed || s.done {
+		s.mu.Unlock()
 		return
 	}
-
-	s.deliver(streamDelivery{payload: frame.Payload})
+	size := uint64(len(frame.Payload))
+	if size <= s.recvByteLimit-s.bufferedBytes {
+		select {
+		case s.recvCh <- frame.Payload:
+			s.bufferedBytes += size
+			s.mu.Unlock()
+			return
+		default:
+		}
+	}
+	s.mu.Unlock()
+	s.abort(fmt.Errorf("%w: stream receive buffer exhausted", ErrBackpressure))
 }
 
 func (s *Stream) deliverEnd() {
-	if s == nil {
-		return
+	s.mu.Lock()
+	s.closeRecvLocked(io.EOF)
+	finished := s.sendEnded
+	s.mu.Unlock()
+	if finished {
+		s.finish(ErrClosed)
 	}
-	s.closeRecv(io.EOF)
-	s.remove()
 }
 
 func (s *Stream) deliverError(err error) {
-	if s == nil {
-		return
-	}
 	if err == nil {
 		err = ErrUnavailable
 	}
-
-	s.closeRecv(err)
 	s.finish(err)
 }
 
-func (s *Stream) deliver(delivery streamDelivery) {
-	select {
-	case s.recvCh <- delivery:
-	case <-s.ctx.Done():
+func (s *Stream) finish(err error) bool {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return false
 	}
-}
-
-func (s *Stream) finish(err error) {
-	if s == nil {
-		return
-	}
-	if !s.done.CompareAndSwap(false, true) {
-		return
-	}
-	if err == nil {
-		err = ErrClosed
-	}
-
-	s.closeRecv(err)
-	s.cancel()
-	s.remove()
-}
-
-func (s *Stream) closeRecv(err error) {
-	if s == nil {
-		return
-	}
-	if err == nil {
-		err = io.EOF
-	}
-	if !s.recvClosed.CompareAndSwap(false, true) {
-		return
-	}
-
-	s.recvErrMu.Lock()
-	s.recvErr = err
-	s.recvErrMu.Unlock()
-
-	close(s.recvDone)
-}
-
-func (s *Stream) remove() {
+	s.done = true
+	s.closeRecvLocked(err)
+	s.cancel(err)
+	s.mu.Unlock()
 	if s.onDone != nil {
-		s.removeOnce.Do(func() {
-			s.onDone(s.requestID)
-		})
+		s.onDone(s)
 	}
+	return true
+}
+
+func (s *Stream) closeRecvLocked(err error) {
+	if s.recvClosed {
+		return
+	}
+	s.recvClosed = true
+	s.recvErr = err
+	close(s.recvDone)
 }
 
 // StreamReader is a typed receive-only stream wrapper.
@@ -448,23 +468,41 @@ func (s *ClientStreamHandle[Item, Resp]) CloseAndRecv() (Resp, error) {
 	}
 	defer s.stream.finish(ErrClosed)
 
-	if err := s.stream.CloseSend(); err != nil {
-		return resp, err
-	}
-
+	// A handler may return before the caller closes its send side.
 	select {
 	case response := <-s.responseCh:
-		if response.err != nil {
-			return resp, response.err
-		}
-		err := decodeResponse(s.codec, response.frame, &resp)
-		return resp, err
-	case <-s.stream.Context().Done():
-		if s.removePending != nil {
-			s.removePending(s.stream.RequestID())
-		}
-		return resp, s.stream.Context().Err()
+		return s.decodeResponse(response)
+	default:
 	}
+	if err := s.stream.CloseSend(); err != nil {
+		select {
+		case response := <-s.responseCh:
+			return s.decodeResponse(response)
+		default:
+			return resp, err
+		}
+	}
+	select {
+	case response := <-s.responseCh:
+		return s.decodeResponse(response)
+	case <-s.stream.Context().Done():
+		// Response delivery cancels the stream to wake any blocked sender.
+		select {
+		case response := <-s.responseCh:
+			return s.decodeResponse(response)
+		default:
+			return resp, context.Cause(s.stream.Context())
+		}
+	}
+}
+
+func (s *ClientStreamHandle[Item, Resp]) decodeResponse(response clientResponse) (Resp, error) {
+	var resp Resp
+	if response.err != nil {
+		return resp, response.err
+	}
+	err := decodeResponse(s.codec, response.frame, &resp)
+	return resp, err
 }
 
 // Cancel cancels the stream and sends a best-effort cancel frame.

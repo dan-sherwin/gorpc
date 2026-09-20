@@ -57,6 +57,29 @@ func (e *RemoteError) Error() string {
 	return fmt.Sprintf("remote error %s: %s", e.Code, e.Message)
 }
 
+// Is matches remote transport and context errors to their local sentinels.
+func (e *RemoteError) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	switch e.Code {
+	case ErrorCodeCanceled:
+		return target == context.Canceled
+	case ErrorCodeDeadlineExceeded:
+		return target == context.DeadlineExceeded
+	case ErrorCodeUnavailable:
+		return target == ErrUnavailable
+	case ErrorCodeBackpressure:
+		return target == ErrBackpressure
+	case ErrorCodeUnauthorized:
+		return target == ErrAuthentication
+	case ErrorCodePeerConnected:
+		return target == ErrPeerConnected
+	default:
+		return false
+	}
+}
+
 // NewRemoteError creates a structured error suitable for returning from a handler.
 func NewRemoteError(code, message string, details map[string]any) *RemoteError {
 	return &RemoteError{
@@ -83,6 +106,8 @@ func remoteErrorFromError(err error) RemoteError {
 		return RemoteError{Code: ErrorCodeDeadlineExceeded, Message: err.Error()}
 	case errors.Is(err, ErrBackpressure):
 		return RemoteError{Code: ErrorCodeBackpressure, Message: err.Error()}
+	case errors.Is(err, ErrUnavailable):
+		return RemoteError{Code: ErrorCodeUnavailable, Message: err.Error()}
 	default:
 		return RemoteError{Code: ErrorCodeInternal, Message: err.Error()}
 	}

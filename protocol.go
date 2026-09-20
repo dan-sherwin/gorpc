@@ -3,6 +3,8 @@ package gorpc
 // ProtocolVersion is the current GoRPC wire protocol version.
 const ProtocolVersion uint16 = 1
 
+const capabilityStreamCredit = "stream-credit-v1"
+
 // FrameType identifies the kind of message carried by a frame.
 type FrameType uint8
 
@@ -22,6 +24,7 @@ const (
 	FrameAuthAck
 	FrameNotify
 	FrameStreamStart
+	FrameStreamWindow
 )
 
 func (t FrameType) String() string {
@@ -54,6 +57,8 @@ func (t FrameType) String() string {
 		return "notify"
 	case FrameStreamStart:
 		return "stream_start"
+	case FrameStreamWindow:
+		return "stream_window"
 	default:
 		return "unknown"
 	}
@@ -95,23 +100,27 @@ type Frame struct {
 	Compression      string     `msgpack:"compression,omitempty"`
 	DeadlineUnixNano int64      `msgpack:"deadline_unix_nano,omitempty"`
 	Payload          []byte     `msgpack:"payload,omitempty"`
+	WindowItems      uint64     `msgpack:"window_items,omitempty"`
+	WindowBytes      uint64     `msgpack:"window_bytes,omitempty"`
 }
 
 type hello struct {
-	ProtocolVersion uint16 `msgpack:"protocol_version"`
-	Codec           string `msgpack:"codec"`
-	ClientName      string `msgpack:"client_name,omitempty"`
-	Compression     string `msgpack:"compression,omitempty"`
-	AuthMethod      string `msgpack:"auth_method,omitempty"`
+	ProtocolVersion uint16   `msgpack:"protocol_version"`
+	Codec           string   `msgpack:"codec"`
+	ClientName      string   `msgpack:"client_name,omitempty"`
+	Compression     string   `msgpack:"compression,omitempty"`
+	AuthMethod      string   `msgpack:"auth_method,omitempty"`
+	Capabilities    []string `msgpack:"capabilities,omitempty"`
 }
 
 type helloAck struct {
-	ProtocolVersion uint16 `msgpack:"protocol_version"`
-	Codec           string `msgpack:"codec"`
-	Compression     string `msgpack:"compression,omitempty"`
-	AuthRequired    bool   `msgpack:"auth_required,omitempty"`
-	AuthMethod      string `msgpack:"auth_method,omitempty"`
-	AuthChallenge   []byte `msgpack:"auth_challenge,omitempty"`
+	ProtocolVersion uint16   `msgpack:"protocol_version"`
+	Codec           string   `msgpack:"codec"`
+	Compression     string   `msgpack:"compression,omitempty"`
+	AuthRequired    bool     `msgpack:"auth_required,omitempty"`
+	AuthMethod      string   `msgpack:"auth_method,omitempty"`
+	AuthChallenge   []byte   `msgpack:"auth_challenge,omitempty"`
+	Capabilities    []string `msgpack:"capabilities,omitempty"`
 }
 
 type authRequest struct {

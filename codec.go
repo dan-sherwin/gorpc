@@ -6,6 +6,9 @@ import "github.com/vmihailenco/msgpack/v5"
 const CodecMessagePack = "msgpack"
 
 // Codec marshals frame envelopes and function payloads.
+// Implementations must be safe for concurrent use and ignore unknown fields
+// when decoding envelopes and handshakes, so optional protocol extensions can
+// coexist with older peers.
 type Codec interface {
 	Name() string
 	Marshal(v any) ([]byte, error)

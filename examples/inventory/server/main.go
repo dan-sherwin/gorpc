@@ -1,58 +1,72 @@
-// Package main runs the GoRPC Inventory example server.
+// Package main runs the inventory example server.
 package main
 
 import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
 	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/dan-sherwin/gorpc"
+	"github.com/dan-sherwin/gorpc/examples/inventory/api"
 )
 
-type GetItemRequest struct {
-	ID string
-}
-
-type GetItemResponse struct {
-	ID   string
-	Name string
-}
-
-type ClientNote struct {
-	ItemID string
-}
-
-func getItem(ctx *gorpc.Context, req GetItemRequest) (GetItemResponse, error) {
-	log.Printf("handling %s request_id=%d client=%q remote=%s",
-		ctx.Function(),
-		ctx.RequestID(),
-		ctx.ClientName(),
-		ctx.RemoteAddr(),
-	)
-
+func getItem(ctx *gorpc.Context, req api.GetItemRequest) (api.GetItemResponse, error) {
 	if req.ID == "missing-item" {
-		return GetItemResponse{}, gorpc.NewRemoteError(gorpc.ErrorCodeNotFound, "item not found", map[string]any{
+		return api.GetItemResponse{}, gorpc.NewRemoteError(gorpc.ErrorCodeNotFound, "item not found", map[string]any{
 			"item_id": req.ID,
 		})
 	}
-
-	if err := ctx.Notify("client_note", ClientNote{ItemID: req.ID}); err != nil {
-		log.Printf("client notification failed: %v", err)
+	if err := ctx.NotifyContext(ctx, api.Note, api.ClientNote{ItemID: req.ID}); err != nil {
+		return api.GetItemResponse{}, err
 	}
-
-	return GetItemResponse{
-		ID:   req.ID,
-		Name: "Widget Pack",
-	}, nil
+	return api.GetItemResponse{ID: req.ID, Name: "Widget Pack"}, nil
 }
 
 func main() {
-	const addr = "127.0.0.1:9070"
-
-	server := gorpc.NewServer(gorpc.ServerOptions{})
-
-	gorpc.MustRegister(server, "get_an_item", getItem)
-
-	log.Println("listening on", addr)
-	if err := server.ServeTCP(addr); err != nil {
+	address := flag.String("addr", "127.0.0.1:9070", "listen address")
+	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, *address, os.Getenv("GORPC_EXAMPLE_SECRET"), os.Stdout); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func run(ctx context.Context, address, secret string, out io.Writer) (err error) {
+	options := gorpc.ServerOptions{}
+	if secret != "" {
+		options.Auth = gorpc.SharedSecret(secret)
+	}
+	server := gorpc.NewServer(options)
+	gorpc.MustRegister(server, api.GetItem, getItem)
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
+	served := make(chan error, 1)
+	go func() { served <- server.ServeListener(listener) }()
+	// Use a fresh context: the signal context is already canceled. Shutdown
+	// cancels in-flight work and waits for handlers; it does not drain requests.
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		err = errors.Join(err, server.Shutdown(shutdownCtx))
+	}()
+	if _, err := fmt.Fprintln(out, "listening on", listener.Addr()); err != nil {
+		return err
+	}
+	select {
+	case err := <-served:
+		return err
+	case <-ctx.Done():
+		return nil
 	}
 }

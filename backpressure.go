@@ -37,6 +37,17 @@ type writeLimiter struct {
 	slots chan struct{}
 }
 
+// Control traffic must still make progress when application writes hit their
+// limit; otherwise a full stream can prevent the credit that would unblock it.
+func isControlFrame(t FrameType) bool {
+	switch t {
+	case FrameCancel, FrameError, FramePing, FramePong, FrameStreamEnd, FrameStreamWindow:
+		return true
+	default:
+		return false
+	}
+}
+
 func newWriteLimiter(limit int) *writeLimiter {
 	if limit <= 0 {
 		return nil
