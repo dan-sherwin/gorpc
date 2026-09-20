@@ -10,6 +10,11 @@ The stream-credit extension adds `window_items` and `window_bytes`.
 `MaxFrameSize` bounds the encoded map and, separately, the uncompressed payload.
 The length prefix is not included in that limit.
 
+The default codec requires exactly one complete MessagePack value for each
+envelope or decoded payload, with at most 64 nested arrays or maps. It checks
+encoded lengths before allocation and rejects trailing data. Unknown map
+fields are still accepted when their values meet these structural limits.
+
 Request IDs distinguish independent operations on the same connection. The
 dialing peer allocates odd IDs and the accepting peer allocates even IDs.
 Responses, stream items, cancellation, and credit frames reuse the originating

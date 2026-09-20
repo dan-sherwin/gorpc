@@ -15,7 +15,8 @@ type Codec interface {
 	Unmarshal(data []byte, v any) error
 }
 
-// MessagePackCodec is the default v1 codec.
+// MessagePackCodec is the default v1 codec. It accepts one complete MessagePack
+// value with at most 64 nested arrays or maps.
 type MessagePackCodec struct{}
 
 // Name returns the handshake name for MessagePackCodec.
@@ -30,6 +31,9 @@ func (MessagePackCodec) Marshal(v any) ([]byte, error) {
 
 // Unmarshal decodes MessagePack data into v.
 func (MessagePackCodec) Unmarshal(data []byte, v any) error {
+	if err := validateMessagePack(data); err != nil {
+		return err
+	}
 	return msgpack.Unmarshal(data, v)
 }
 

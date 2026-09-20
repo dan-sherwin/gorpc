@@ -43,10 +43,11 @@ byte credit, half-close, cancellation, early responses, connection replacement,
 and shutdown. Repeat the race suite when changing stream or connection state;
 a single passing run gives limited coverage of scheduling-dependent failures.
 
-Frame fuzzing is separate:
+Frame and MessagePack payload fuzzing are separate:
 
 ```sh
 go test -run '^$' -fuzz=FuzzReadFrame -fuzztime=2000000x -parallel=4 -timeout=5m
+go test -run '^$' -fuzz=FuzzMessagePack -fuzztime=2000000x -parallel=4 -timeout=5m
 ```
 
 The execution count avoids the timed-fuzz cancellation race in Go 1.26.6
@@ -57,6 +58,11 @@ run does not retroactively turn an earlier timed failure into a pass.
 Keep any reported failing input and reproduce it before changing the decoder.
 A runner timeout without a failing input is an incomplete run, not a passing
 fuzz result.
+
+Decoder regression tests check advertised lengths before allocation, nesting
+limits, every MessagePack format, and unknown-field compatibility. The frame
+size bounds the encoded input, not arbitrary allocations inside a decoder;
+watch resource use as well as panic reports when investigating fuzz failures.
 
 ## Downstream applications
 

@@ -155,6 +155,10 @@ func FuzzReadFrame(f *testing.F) {
 		}
 		f.Add(wire.Bytes())
 	}
+	// A small envelope can still advertise a huge binary payload internally.
+	malformed := []byte{0x81, 0xa7, 'p', 'a', 'y', 'l', 'o', 'a', 'd', 0xc6, 0xff, 0xff, 0xff, 0xff}
+	wire := binary.BigEndian.AppendUint32(nil, uint32(len(malformed)))
+	f.Add(append(wire, malformed...))
 	f.Fuzz(func(_ *testing.T, data []byte) {
 		_, _ = readFrameWithCompression(bytes.NewReader(data), 4096, MessagePackCodec{}, GzipCompression())
 	})

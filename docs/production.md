@@ -56,6 +56,13 @@ Choose frame sizes, item sizes, receive windows, and concurrent stream counts
 together. Leave room for MessagePack and frame-envelope overhead. Compression
 does not make an oversized decoded payload acceptable.
 
+The default MessagePack codec checks that each value is complete before
+decoding, rejects trailing data, and allows at most 64 nested arrays or maps.
+This prevents a truncated length prefix from requesting an oversized allocation.
+It does not cap the memory used by valid decoded Go objects or custom decoders;
+validate application collection sizes and choose types accordingly. Custom
+codecs are responsible for their own decoding limits.
+
 `BackpressureOptions` can limit pending outbound calls, tracked streams, and
 concurrent application writes per connection. These limits are opt-in; they
 do not cap total connections or inbound unary handler concurrency. Apply

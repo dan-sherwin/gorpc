@@ -54,6 +54,9 @@ jobs:
           trap 'kill "$fuzz_monitor_pid" 2>/dev/null || true' EXIT
           go test -run '^$' -fuzz=FuzzReadFrame -fuzztime=2000000x -parallel=4 -timeout=5m
 
+      - name: Fuzz MessagePack payloads
+        run: go test -run '^$' -fuzz=FuzzMessagePack -fuzztime=2000000x -parallel=4 -timeout=5m
+
       - name: GolangCI-Lint
         uses: golangci/golangci-lint-action@v7
         with:

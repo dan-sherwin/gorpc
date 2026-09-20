@@ -34,6 +34,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Fixed
 
+- Malformed MessagePack lengths are rejected before decoding can allocate from them; excessive nesting and trailing data are also rejected.
 - Closing a client during its initial handshake no longer races connection publication or panics on a closed readiness channel.
 - Concurrent connection attempts share one handshake and honor each caller's cancellation.
 - Bidirectional streams keep their remaining send direction alive after a remote half-close.
