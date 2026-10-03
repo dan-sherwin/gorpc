@@ -10,9 +10,9 @@ streams. Either end can initiate work.
 No schema files, generated stubs, or separate DTO models. GoRPC uses
 length-prefixed MessagePack frames, with optional gzip compression.
 
-**Version note:** `v1.0.0-rc.4` is a release candidate with negotiated stream
-flow control and [hardening changes](CHANGELOG.md). Flow control is not in
-`v1.0.0-rc.3`. Read the documentation at your dependency's tag.
+**Version note:** `v1.0.0` is the first stable release, with negotiated stream
+flow control and [hardening changes](CHANGELOG.md) validated in `v1.0.0-rc.4`.
+Read the documentation at your dependency's tag.
 
 ## Why GoRPC?
 
@@ -54,10 +54,8 @@ shared types, address options, and optional authentication. For your own module,
 install the version you intend to use explicitly, for example:
 
 ~~~sh
-go get github.com/dan-sherwin/gorpc@v1.0.0-rc.4
+go get github.com/dan-sherwin/gorpc@v1.0.0
 ~~~
-
-That installs the release candidate, not a stable `v1.0.0` release.
 
 ## The API in brief
 
@@ -182,4 +180,6 @@ access. See [testing](docs/testing.md) for narrower checks.
 ## Versioning and license
 
 Semantic Versioning; see the [changelog](CHANGELOG.md) for release history.
+Public API compatibility is preserved within v1. Breaking API changes require
+a new major version.
 MIT licensed; see [LICENSE](LICENSE).

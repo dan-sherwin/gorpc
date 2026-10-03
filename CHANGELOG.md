@@ -6,6 +6,13 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [v1.0.0] - 2026-10-02
+
+### Changed
+
+- Promoted `v1.0.0-rc.4` to the first stable release, preserving its public API and runtime implementation.
+- Updated installation and version guidance for `v1.0.0`.
+
 ## [v1.0.0-rc.4] - 2026-09-20
 
 ### Added
@@ -125,7 +132,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Optional `slog` debug logging hooks.
 - CI workflow covering tidy, build, vet, race tests, lint, and govulncheck.
 
-[Unreleased]: https://github.com/dan-sherwin/gorpc/compare/v1.0.0-rc.4...HEAD
+[Unreleased]: https://github.com/dan-sherwin/gorpc/compare/v1.0.0...HEAD
+[v1.0.0]: https://github.com/dan-sherwin/gorpc/releases/tag/v1.0.0
 [v1.0.0-rc.4]: https://github.com/dan-sherwin/gorpc/releases/tag/v1.0.0-rc.4
 [v1.0.0-rc.3]: https://github.com/dan-sherwin/gorpc/releases/tag/v1.0.0-rc.3
 [v1.0.0-rc.2]: https://github.com/dan-sherwin/gorpc/releases/tag/v1.0.0-rc.2
